@@ -1,0 +1,98 @@
+
+def register_gatt_application(self):
+    service_manager = dbus.Interface(
+        self.bus.get_object(constants.bluez_service, self.adapter_path),
+        constants.gatt_manager_interface
+    )
+
+    try:
+        service_manager.RegisterApplication(self.application.get_path(), {})
+        self.is_server_running = True
+        self.log.info("GATT application registered successfully.")
+    except dbus.exceptions.DBusException as error:
+        self.log.error(f"Failed to register GATT application: {error}")
+
+
+def start_advertising(self, service_uuid):
+    if self.advertisement is None:
+        self.setup_advertisement(service_uuid)
+
+    advertisement_manager = dbus.Interface(
+        self.bus.get_object(constants.bluez_service, self.adapter_path),
+        constants.le_advertising_manager_interface
+    )
+
+    try:
+        advertisement_manager.RegisterAdvertisement(self.advertisement.get_path(), {})
+        self.is_advertising = True
+        self.log.info("Advertisement registered successfully.")
+        self.mainloop.run()
+    except dbus.exceptions.DBusException as error:
+        self.log.error(f"Failed to register advertisement: {error}")
+        self.advertisement = None
+
+
+def stop_advertising(self):
+    if not self.is_advertising or not self.advertisement:
+        self.log.info("Advertising is already stopped.")
+        return
+
+    old_advertisement = self.advertisement
+    self.advertisement = None
+    self.is_advertising = False
+
+    advertisement_manager = dbus.Interface(
+        self.bus.get_object(constants.bluez_service, self.adapter_path),
+        constants.le_advertising_manager_interface
+    )
+
+    try:
+        advertisement_manager.UnregisterAdvertisement(old_advertisement.get_path())
+        self.log.info("Advertisement stopped successfully.")
+    except dbus.exceptions.DBusException as error:
+        self.log.error(f"Failed to stop advertisement: {error}")
+
+    # Cleanup
+    try:
+        old_advertisement.remove_from_connection(self.bus, old_advertisement.get_path())
+    except Exception as error:
+        self.log.warning(f"Error removing advertisement object: {error}")
+
+
+def stop_gatt_server(self):
+    if not self.is_server_running:
+        self.log.info("Server is already stopped.")
+        return
+
+    if self.application:
+        for service in self.application.services:
+            for char in service.get_characteristics():
+                if hasattr(char, "StopNotify"):
+                    char.StopNotify()
+
+    self.stop_advertising()
+    old_application = self.application
+    self.application = None
+
+    service_manager = dbus.Interface(
+        self.bus.get_object(constants.bluez_service, self.adapter_path),
+        constants.gatt_manager_interface
+    )
+
+    try:
+        service_manager.UnregisterApplication(old_application.get_path())
+        self.log.info("GATT application unregistered successfully.")
+    except dbus.exceptions.DBusException as error:
+        self.log.error(f"Failed to unregister GATT application: {error}")
+
+    # Cleanup services and characteristics
+    try:
+        for service in old_application.services:
+            for char in service.get_characteristics():
+                if hasattr(char, "descriptor"):
+                    char.descriptor.remove_from_connection(self.bus, char.descriptor.get_path())
+                char.remove_from_connection(self.bus, char.get_path())
+            service.remove_from_connection(self.bus, service.get_path())
+        old_application.remove_from_connection(self.bus, old_application.get_path())
+    except Exception as error:
+        self.log.warning(f"Failed removing service or children: {error}")

@@ -1,98 +1,1151 @@
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+import os
+import subprocess
+import time
 
-def register_gatt_application(self):
-    service_manager = dbus.Interface(
-        self.bus.get_object(constants.bluez_service, self.adapter_path),
-        constants.gatt_manager_interface
-    )
+from PyQt6.QtWidgets import QMessageBox
 
-    try:
-        service_manager.RegisterApplication(self.application.get_path(), {})
-        self.is_server_running = True
-        self.log.info("GATT application registered successfully.")
-    except dbus.exceptions.DBusException as error:
-        self.log.error(f"Failed to register GATT application: {error}")
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
 
+DBusGMainLoop(set_as_default=True)
 
-def start_advertising(self, service_uuid):
-    if self.advertisement is None:
-        self.setup_advertisement(service_uuid)
-
-    advertisement_manager = dbus.Interface(
-        self.bus.get_object(constants.bluez_service, self.adapter_path),
-        constants.le_advertising_manager_interface
-    )
-
-    try:
-        advertisement_manager.RegisterAdvertisement(self.advertisement.get_path(), {})
-        self.is_advertising = True
-        self.log.info("Advertisement registered successfully.")
-        self.mainloop.run()
-    except dbus.exceptions.DBusException as error:
-        self.log.error(f"Failed to register advertisement: {error}")
-        self.advertisement = None
+from libraries.bluetooth import constants
+from libraries.bluetooth.gatt_client import get_device_path_by_address, find_characteristics, battery_status_level, start_notify
+from Utils.utils import run
 
 
-def stop_advertising(self):
-    if not self.is_advertising or not self.advertisement:
-        self.log.info("Advertising is already stopped.")
-        return
+class BluetoothDeviceManager:
+    """A class for managing Bluetooth devices using the BlueZ D-Bus API."""
 
-    old_advertisement = self.advertisement
-    self.advertisement = None
-    self.is_advertising = False
+    def __init__(self, log=None, interface=None):
+        """Initialize the BluetoothDeviceManager by setting up the system bus and adapter.
 
-    advertisement_manager = dbus.Interface(
-        self.bus.get_object(constants.bluez_service, self.adapter_path),
-        constants.le_advertising_manager_interface
-    )
+        Args:
+            log: Logger instance.
+            interface: Bluetooth adapter interface (e.g., hci0).
+        """
+        self.bus = dbus.SystemBus()
+        self.interface = interface
+        self.log = log
+        self.adapter_path = f'{constants.bluez_path}/{self.interface}'
+        self.adapter_proxy = self.bus.get_object(constants.bluez_service, self.adapter_path)
+        self.adapter = dbus.Interface(self.adapter_proxy, constants.adapter_interface)
+        self.adapter_properties = dbus.Interface(self.adapter_proxy, constants.properties_interface)
+        self.object_manager = dbus.Interface(self.bus.get_object(constants.bluez_service, "/"), constants.object_manager_interface)
+        self.opp_process = None
+        self.pulseaudio_process = None
+        self.stream_process = None
+        self.device_profiles = {}
+        self.device_states = {}
+        self.device_address = None
+        self.on_battery_level = None
+        self.on_battery_status = None
 
-    try:
-        advertisement_manager.UnregisterAdvertisement(old_advertisement.get_path())
-        self.log.info("Advertisement stopped successfully.")
-    except dbus.exceptions.DBusException as error:
-        self.log.error(f"Failed to stop advertisement: {error}")
+    def get_paired_devices(self):
+        """Retrieves all Bluetooth devices that are currently paired with the adapter.
 
-    # Cleanup
-    try:
-        old_advertisement.remove_from_connection(self.bus, old_advertisement.get_path())
-    except Exception as error:
-        self.log.warning(f"Error removing advertisement object: {error}")
+        Returns:
+            paired_devices: A dictionary of paired devices.
+        """
+        paired_devices = {}
+        for path, interfaces in self.object_manager.GetManagedObjects().items():
+            if constants.device_interface in interfaces:
+                device = interfaces[constants.device_interface]
+                if device.get("Paired") and device.get("Adapter") == self.adapter_path:
+                    address = device.get("Address")
+                    name = device.get("Name", "Unknown")
+                    paired_devices[address] = name
+        return paired_devices
 
+    def set_discovery_filter(self, filter_dict):
+        """
+        Set the Bluetooth discovery filter via BlueZ.
 
-def stop_gatt_server(self):
-    if not self.is_server_running:
-        self.log.info("Server is already stopped.")
-        return
+        Args:
+            filter_dict (str): "LE", "BR/EDR", or "ALL"
+        """
+        try:
+            self.adapter.SetDiscoveryFilter(filter_dict)
+            self.log.debug("BlueZ discovery filter set: %s", filter_dict)
+        except Exception as e:
+            self.log.error("Failed to set discovery filter: %s", e)
 
-    if self.application:
-        for service in self.application.services:
-            for char in service.get_characteristics():
-                if hasattr(char, "StopNotify"):
-                    char.StopNotify()
+    def start_discovery(self):
+        """Start scanning for nearby Bluetooth devices, if not already discovering."""
+        try:
+            if not self.adapter_properties.Get(constants.adapter_interface, "Discovering"):
+                self.adapter.StartDiscovery()
+                self.log.info("Discovery started.")
+            else:
+                self.log.info("Discovery already in progress.")
+        except dbus.exceptions.DBusException as error:
+            self.log.error("Failed to start discovery: %s", error)
 
-    self.stop_advertising()
-    old_application = self.application
-    self.application = None
+    def stop_discovery(self):
+        """Stop Bluetooth device discovery, if it's running."""
+        try:
+            if self.adapter_properties.Get(constants.adapter_interface, "Discovering"):
+                self.adapter.StopDiscovery()
+                self.log.info("Discovery stopped.")
+            else:
+                self.log.info("Discovery is not running.")
+        except dbus.exceptions.DBusException as error:
+            self.log.error("Failed to stop discovery: %s", error)
 
-    service_manager = dbus.Interface(
-        self.bus.get_object(constants.bluez_service, self.adapter_path),
-        constants.gatt_manager_interface
-    )
+    def get_discovered_devices(self):
+        """Retrieve discovered Bluetooth devices under the current adapter.
 
-    try:
-        service_manager.UnregisterApplication(old_application.get_path())
-        self.log.info("GATT application unregistered successfully.")
-    except dbus.exceptions.DBusException as error:
-        self.log.error(f"Failed to unregister GATT application: {error}")
+        Returns:
+            discovered_devices: List of discovered Bluetooth devices.
+        """
+        discovered_devices = []
+        for path, interfaces in self.object_manager.GetManagedObjects().items():
+            device = interfaces.get(constants.device_interface)
+            if not device or device.get("Adapter") != self.adapter_path:
+                continue
+            address = device.get("Address")
+            alias = device.get("Alias", "Unknown")
+            if address:
+                discovered_devices.append({
+                    "path": path,
+                    "address": address,
+                    "alias": alias})
+            else:
+                self.log.warning("Failed to extract device info from %s", path)
+        return discovered_devices
 
-    # Cleanup services and characteristics
-    try:
-        for service in old_application.services:
-            for char in service.get_characteristics():
-                if hasattr(char, "descriptor"):
-                    char.descriptor.remove_from_connection(self.bus, char.descriptor.get_path())
-                char.remove_from_connection(self.bus, char.get_path())
-            service.remove_from_connection(self.bus, service.get_path())
-        old_application.remove_from_connection(self.bus, old_application.get_path())
-    except Exception as error:
-        self.log.warning(f"Failed removing service or children: {error}")
+    def find_device_path(self, address):
+        """Find the D-Bus object path of a device by address under the correct adapter.
+
+        Args:
+            address: Bluetooth address of remote device.
+
+        Returns:
+            path: D-Bus object path or None if not found.
+        """
+        formatted_interface_path = f"{constants.bluez_path}/{self.interface}/"
+        for path, interfaces in self.object_manager.GetManagedObjects().items():
+            if constants.device_interface in interfaces:
+                if formatted_interface_path in path:
+                    props = interfaces[constants.device_interface]
+                    if props.get("Address") == address:
+                        return path
+        return None
+
+    def register_agent(self, capability=None):
+        """Register this object as a Bluetooth pairing agent.
+
+        Args:
+            capability: The capability of the agent (e.g., "DisplayYesNo",
+            "KeyboardOnly", "NoInputNoOutput"). Defaults to None.
+        """
+        agent_manager = dbus.Interface(self.bus.get_object(constants.bluez_service, constants.bluez_path), constants.agent_interface)
+        agent_manager.RegisterAgent(constants.agent_path, capability)
+        agent_manager.RequestDefaultAgent(constants.agent_path)
+        self.log.info("Registered with capability:%s", capability)
+
+    def pair(self, address):
+        """Pairs with a Bluetooth device using the given controller interface.
+
+        Args:
+            address: Bluetooth address of remote device.
+
+        Returns:
+            True if successfully paired, False otherwise.
+        """
+        device_path = self.find_device_path(address)
+        if not device_path:
+            self.log.info("Device path not found for %s on %s", address, self.interface)
+            return False
+        try:
+            device_proxy = self.bus.get_object(constants.bluez_service, device_path)
+            device = dbus.Interface(device_proxy, constants.device_interface)
+            properties = dbus.Interface(device_proxy, constants.properties_interface)
+            paired = properties.Get(constants.device_interface, "Paired")
+            if paired:
+                self.log.info("Device %s is already paired.", address)
+                return True
+            self.log.info("Initiating pairing with %s", address)
+            device.Pair()
+            paired = properties.Get(constants.device_interface, "Paired")
+            if paired:
+                self.log.info("Successfully paired with %s", address)
+                return True
+            self.log.warning("Pairing not confirmed with %s within the timeout period.", address)
+            return False
+        except dbus.exceptions.DBusException as error:
+            self.log.error("Pairing failed with %s: %s", address, error)
+            return False
+
+    def connect(self, address):
+        """Establish a  connection to the specified Bluetooth device.
+
+        Args:
+            address: Bluetooth address of remote device.
+
+        Returns:
+            True if connected, False otherwise.
+        """
+        self.device_address = address
+        device_path = self.find_device_path(self.device_address)
+        if device_path:
+            try:
+                device = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path), constants.device_interface)
+                device.Connect()
+                properties = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path), constants.properties_interface)
+                connected = properties.Get(constants.device_interface, "Connected")
+                if connected:
+                    self.log.info("Connection successful to %s", self.device_address)
+                    return True
+            except Exception as error:
+                self.log.info("Connection failed:%s", error)
+                return False
+        else:
+            self.log.info("Device path not found for address %s", self.device_address)
+            return False
+
+    def disconnect(self, address):
+        """Disconnect a Bluetooth  device from the specified adapter.
+
+        Args:
+            address: Bluetooth address of remote device.
+
+        Returns:
+            True if disconnected or already disconnected, False if an error occurred.
+        """
+        device_path = self.find_device_path(address)
+        if device_path:
+            try:
+                device = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path), constants.device_interface)
+                props = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path), constants.properties_interface)
+                connected = props.Get(constants.device_interface, "Connected")
+                if not connected:
+                    self.log.info("Device %s is already disconnected.", address)
+                    return True
+                device.Disconnect()
+                return True
+            except dbus.exceptions.DBusException as error:
+                self.log.info("Error disconnecting device %s:%s", address, error)
+        return False
+
+    def unpair_device(self, address):
+        """Removes a paired or known Bluetooth device from the system using BlueZ D-Bus.
+
+        Args:
+            address: Bluetooth address of the remote device.
+
+        Returns:
+            True if the device was removed successfully or already not present,
+            False if the removal failed or the device still exists afterward.
+        """
+        try:
+            target_path = None
+            for path, interfaces in self.object_manager.GetManagedObjects().items():
+                if constants.device_interface in interfaces:
+                    if interfaces[constants.device_interface].get("Address") == address and path.startswith(
+                            self.adapter_path):
+                        target_path = path
+                        break
+            if not target_path:
+                self.log.info("Device with address %s not found on %s", address, self.interface)
+                return True
+            self.adapter.RemoveDevice(target_path)
+            self.log.info("Requested removal of device %s at path %s", address, target_path)
+            time.sleep(0.5)
+            for path, interfaces in self.object_manager.GetManagedObjects().items():
+                if constants.device_interface in interfaces:
+                    if interfaces[constants.device_interface].get("Address") == address:
+                        self.log.warning("Device %s still exists after attempted removal", address)
+                        return False
+            self.log.info("Device %s removed successfully", address)
+            return True
+        except dbus.exceptions.DBusException as error:
+            self.log.error("DBusException while removing device %s: %s", address, error)
+            return False
+
+    def is_device_paired(self, device_address):
+        """Checks if the specified device is paired.
+
+        Args:
+            device_address: Bluetooth address of remote device.
+
+        Returns:
+            True if paired, False otherwise.
+        """
+        device_path = self.find_device_path(device_address)
+        if not device_path:
+            return False
+        properties = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path), constants.properties_interface)
+        try:
+            return properties.Get(constants.device_interface, "Paired")
+        except dbus.exceptions.DBusException as error:
+            self.log.error("DBusException while getting properties of device %s: %s", device_address, error)
+            return False
+
+    def is_device_connected(self, device_address):
+        """Checks if the specified device is connected.
+
+        Args:
+            device_address: Bluetooth address of remote device.
+
+        Returns:
+            True if connected, False otherwise.
+        """
+        device_path = self.find_device_path(device_address)
+        if not device_path:
+            self.log.debug("Device path not found for %s on %s", device_address, self.interface)
+            return False
+        try:
+            properties = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path), constants.properties_interface)
+            connected = properties.Get(constants.device_interface, "Connected")
+            if self.interface not in device_path:
+                self.log.debug("Device path %s does not match interface %s", device_path, self.interface)
+                return False
+            return connected
+        except dbus.exceptions.DBusException as error:
+            self.log.debug("DBusException while checking connection:%s", error)
+            return False
+
+    def start_a2dp_stream(self, address, filepath=None):
+        """Initiates an A2DP audio stream to a Bluetooth device using PulseAudio.
+
+        Args:
+            address: Bluetooth address of remote device.
+            filepath: Path to the audio file.
+
+        Returns:
+            True if the stream was started, False otherwise.
+        """
+        device_path = self.find_device_path(address)
+        self.log.info("Device path: %s", device_path)
+        if not device_path:
+            return None
+        try:
+            if not filepath or not os.path.exists(filepath):
+                self.log.warning("File path %s does not exist", filepath)
+            self.log.info("Starting stream with %s", filepath)
+            self.stream_process = subprocess.Popen(["paplay", filepath], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception as error:
+            self.log.error("Stream error: %s", error)
+            return False
+
+    def stop_a2dp_stream(self):
+        """Stop the current A2DP audio stream
+
+        Returns:
+            True if the stream was stopped, False otherwise.
+        """
+        if hasattr(self, 'stream_process') and self.stream_process:
+            self.stream_process.terminate()
+            self.stream_process = None
+            self.log.info("Stream stopped")
+            return True
+        return False
+
+    def media_control(self, command, address=None):
+        """Sends AVRCP (Audio/Video Remote Control Profile) media control commands to a connected Bluetooth device.
+
+        Args:
+            command: The AVRCP command to send. Must be one of: "play", "pause", "next", "previous", "rewind".
+            address: Bluetooth address of remote device.
+        """
+        valid = {"play": "Play", "pause": "Pause", "next": "Next", "previous": "Previous", "rewind": "Rewind"}
+        if command not in valid:
+            self.log.info("Invalid media control command:%s", command)
+        media_control_interface = self.get_media_control_interface(address)
+        if not media_control_interface:
+            self.log.info(" MediaControl1 interface NOT FOUND")
+        self.log.info(" MediaControl1 interface FOUND")
+        try:
+            getattr(media_control_interface, valid[command])()
+            self.log.info("AVRCP %s sent successfully to %s", command, address)
+        except Exception as error:
+            self.log.warning("AVRCP command %s failed with exception : %s", command, error)
+
+    def get_media_control_interface(self, address):
+        """Retrieve the `org.bluez.MediaControl1` D-Bus interface for a given Bluetooth device.
+
+        Args:
+            address: Bluetooth address of remote device.
+
+        Returns:
+            The MediaControl1 D-Bus interface if found, otherwise None.
+        """
+        try:
+            formatted_addr = address.replace(":", "_").upper()
+            for path, interfaces in self.object_manager.GetManagedObjects().items():
+                if constants.media_control_interface in interfaces:
+                    if formatted_addr in path and path.startswith(self.adapter_path):
+                        self.log.info("Found MediaControl1 at %s", path)
+                        return dbus.Interface(self.bus.get_object(constants.bluez_service, path), constants.media_control_interface)
+            self.log.info(" No MediaControl1 interface found for %s under %s", address, self.adapter_path)
+        except Exception as error:
+            self.log.info(" Exception while getting MediaControl1 interface : %s", error)
+        return None
+
+    def get_a2dp_role_for_device(self, device_address):
+        """Get the A2DP role (sink or source) for a specific connected Bluetooth device.
+
+        Args:
+            device_address: Bluetooth address of remote device.
+
+        Returns:
+            str: "sink", "source", or None
+        """
+        uuid_map = {"source": "110a", "sink": "110b"}
+        for path, interfaces in self.object_manager.GetManagedObjects().items():
+            if constants.device_interface in interfaces:
+                properties = interfaces[constants.device_interface]
+                if properties.get("Address") == device_address and properties.get("Connected") and properties.get("Adapter") == self.adapter_path:
+                    uuids = properties.get("UUIDs", [])
+                    for role, uuid_role in uuid_map.items():
+                        if any(uuid_role in uuid.lower() for uuid in uuids):
+                            return role
+        self.log.warning("Unknown A2DP role %s", device_address)
+
+    def send_file(self, device_address, file_path, session_path=None, profile=None):
+        """Send a file via OBEX OPP and wait for real-time transfer status.
+
+        Args:
+            device_address: Bluetooth address of remote device.
+            file_path: Path to the file to be sent.
+            session_path: Existing OBEX session path. If None, a new session is created.
+            profile: Bluetooth profile to use for the file transfer.
+
+        Returns:
+            Transfer status ("completed", "error", etc.).
+        """
+        if not os.path.exists(file_path):
+            self.log.info("File does not exist: %s", file_path)
+            return "error"
+
+        try:
+            if not session_path:
+                session_path = self.create_obex_session(device_address, profile)
+
+            opp_interface = dbus.Interface(
+                self.session_bus.get_object(constants.obex_service, session_path),
+                constants.obex_object_push
+            )
+            transfer_path, _ = opp_interface.SendFile(file_path)
+            self.log.info("Started transfer: %s", transfer_path)
+
+            self.transfer_status = {"status": "unknown"}
+            self.session_bus.add_signal_receiver(
+                self.obex_properties_changed,
+                dbus_interface=constants.properties_interface,
+                signal_name="PropertiesChanged",
+                arg0=constants.obex_object_transfer,
+                path=transfer_path,
+                path_keyword="path"
+            )
+
+            self.transfer_loop = GLib.MainLoop()
+            self.transfer_loop.run()
+
+            status = self.transfer_status["status"]
+            #self.remove_obex_session(session_path)
+            return status
+
+        except Exception as error:
+            self.log.info("OBEX send failed: %s", error)
+            return "error"
+
+    def receive_file(self, save_directory="/tmp", timeout=20, user_confirm_callback=None):
+        """Start an OBEX Object Push server and wait for a file to be received.
+
+        Args:
+            save_directory: Directory to save received files. Defaults to "/tmp".
+            timeout: Time in seconds to wait for a file. Defaults to 20.
+            user_confirm_callback: Function to confirm acceptance of received file.
+
+        Returns:
+            Full path of accepted received file, or None if no file accepted
+        """
+        try:
+            if not os.path.exists(save_directory):
+                os.makedirs(save_directory)
+            run(self.log, "killall -9 obexpushd")
+            self.log.info("Killed existing obexpushd processes..")
+            existing_files = set(os.listdir(save_directory))
+            self.opp_process = subprocess.Popen(["obexpushd", "-B", "-o", save_directory, "-n"])
+            self.log.info("OPP server started. Waiting for incoming file...")
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                current_files = set(os.listdir(save_directory))
+                new_files = current_files - existing_files
+                if new_files:
+                    received_file = new_files.pop()
+                    full_path = os.path.join(save_directory, received_file)
+                    self.log.info("Incoming file: %s", received_file)
+                    user_accepted = True
+                    if user_confirm_callback:
+                        user_accepted = user_confirm_callback(full_path)
+                    if user_accepted:
+                        self.log.info("User accepted file.")
+                        self.stop_opp_receiver()
+                        return full_path
+                    else:
+                        self.log.info("User rejected file.")
+                        os.remove(full_path)
+                        self.stop_opp_receiver()
+        except Exception as error:
+            self.stop_opp_receiver()
+            self.log.error("Error in receive_file:%s", error)
+
+    def stop_opp_receiver(self):
+        """Stop the OBEX Object Push server if it's currently running."""
+        if self.opp_process and self.opp_process.poll() is None:
+            self.opp_process.terminate()
+            self.opp_process.wait()
+            self.log.info("OPP server stopped.")
+        else:
+            self.log.info("No OPP server running or already stopped.")
+
+    def obex_properties_changed(self, interface, changed, invalidated, path):
+        """Handle the PropertiesChanged signal for an OBEX file transfer.
+
+        Args:
+            interface: The D-Bus interface name where the property change occurred.
+            changed: A dictionary containing the properties that changed and their new values.
+            invalidated: A list of properties that are no longer valid.
+            path: The D-Bus object path for the signal.
+        """
+        if "Status" in changed:
+            status = str(changed["Status"])
+            self.log.info("Signal: Transfer status changed to:%s", status)
+            self.transfer_status["status"] = status
+            if status in ["complete", "error", "cancelled"]:
+                if hasattr(self, "transfer_loop") and self.transfer_loop.is_running():
+                    self.transfer_loop.quit()
+            else:
+                self.log.warning("PropertiesChanged received without 'Status': %s", changed)
+
+    def set_discoverable_mode(self, enable):
+        """
+        Makes the Bluetooth device discoverable.
+
+        Args:
+            enable: True to enable, False to disable.
+        """
+        self.log.info("Setting Bluetooth device to be discoverable...")
+        if enable:
+            command = f"hciconfig {self.interface} piscan"
+            subprocess.run(command, shell=True)
+            self.log.info("Bluetooth device is now discoverable.")
+        elif not enable:
+            self.log.info("Setting Bluetooth device to be non-discoverable...")
+            command = f"hciconfig {self.interface} noscan"
+            subprocess.run(command, shell=True)
+            self.log.info("Bluetooth device is now non-discoverable.")
+
+    def create_obex_session(self, device_address, profile):
+        """Creates an OBEX Object Push (OPP) session.
+
+         Args:
+            device_address: Bluetooth address of remote device, else return False.
+            profile: The bluetooth profile to used for the session.
+
+        Returns:
+            session_path: The OBEX session path if successful.
+        """
+        #DBusGMainLoop(set_as_default=True)
+        try:
+            self.session_bus = dbus.SessionBus()
+            self.obex_manager = dbus.Interface(self.session_bus.get_object(constants.obex_service, constants.obex_path), constants.obex_client)
+            session_path = self.obex_manager.CreateSession(device_address, {"Target": dbus.String(profile)})
+            self.log.info("Created OBEX OPP session: %s", session_path)
+            return session_path
+        except Exception as error:
+            self.log.error("OBEX session creation failed for device %s: %s", device_address, error)
+            return False
+
+    def remove_obex_session(self, session_path):
+        """Removes the given OBEX session.
+
+        Args:
+            session_path: The OBEX session path to be removed.
+        """
+        try:
+            self.obex_manager.RemoveSession(session_path)
+            self.log.info("Removed OBEX session: %s", session_path)
+        except Exception as error:
+            self.log.warning("Failed to remove session: %s", error)
+
+    def get_media_playback_info(self, address):
+        """Retrieve playback status, track info, and position using MediaPlayer1.
+
+        Args:
+            address: Bluetooth address of remote device.
+
+        Returns:
+             status, track, position (ms), duration (ms), or None if unavailable.
+        """
+        try:
+            formatted_addr = address.replace(":", "_").upper()
+            for path, interfaces in self.object_manager.GetManagedObjects().items():
+                if constants.media_player_interface in interfaces:
+                    if formatted_addr in path and path.startswith(self.adapter_path):
+                        media_player = dbus.Interface(self.bus.get_object(constants.bluez_service, path), constants.media_player_interface)
+                        props = dbus.Interface(media_player, constants.properties_interface)
+                        status = props.Get(constants.media_player_interface, "Status")
+                        track = props.Get(constants.media_player_interface, "Track")
+                        position = props.Get(constants.media_player_interface, "Position")
+                        duration = track.get("Duration", 0)
+                        return {
+                            "status": str(status),
+                            "track": {
+                                "title": str(track.get("Title", "")),
+                                "artist": str(track.get("Artist", "")),
+                                "album": str(track.get("Album", "")),
+                            },
+                            "position": int(position),
+                            "duration": int(duration)
+                        }
+        except Exception as error:
+            self.log.warning("Failed to get media playback info: %s", error)
+
+    def get_media_volume(self, address):
+        """Get the current A2DP volume for the given device.
+
+        Args:
+            address: Bluetooth address of remote device.
+
+        Returns:
+            The volume level as an integer if available, otherwise None.
+        """
+        try:
+            formatted_addr = address.replace(":", "_").upper()
+            for path, interfaces in self.object_manager.GetManagedObjects().items():
+                if constants.media_transport_interface in interfaces:
+                    if formatted_addr in path and path.startswith(self.adapter_path):
+                        transport = dbus.Interface(self.bus.get_object(constants.bluez_service, path),
+                                                   constants.properties_interface)
+                        volume = transport.Get(constants.media_transport_interface, "Volume")
+                        return int(volume)
+        except Exception as error:
+            self.log.warning("Failed to get volume: %s", error)
+        return None
+
+    def set_media_volume(self, address, volume):
+        """Set A2DP volume (0–127) for the given device.
+
+        Args:
+            address: Bluetooth address of remote device.
+            volume: Integer volume level to set.
+
+        Returns:
+            True if the volume was set successfully, otherwise False.
+        """
+        try:
+            formatted_addr = address.replace(":", "_").upper()
+            for path, interfaces in self.object_manager.GetManagedObjects().items():
+                if constants.media_transport_interface in interfaces:
+                    if formatted_addr in path and path.startswith(self.adapter_path):
+                        transport = dbus.Interface(self.bus.get_object(constants.bluez_service, path), constants.properties_interface)
+                        transport.Set(constants.media_transport_interface, "Volume", dbus.UInt16(volume))
+                        self.log.info("Volume set to %d", volume)
+                        return True
+        except Exception as error:
+            self.log.warning("Failed to set volume: %s", error)
+        return False
+
+    def get_connected_profile_uuids(self, device_address):
+        """Retrieves the list of UUIDs for the Bluetooth profiles connected to the device
+          identified by the given device address.
+
+        Args:
+            device_address: Bluetooth address of remote device.
+
+        Returns:
+            A list of UUID strings representing the connected profiles.
+            Returns an empty list if the UUIDs cannot be retrieved.
+        """
+        device_path = self.find_device_path(device_address)
+        device = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path), constants.device_interface)
+        properties = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path),
+                                    constants.properties_interface)
+        try:
+            uuids = properties.Get(constants.device_interface, 'UUIDs')
+            return uuids
+        except Exception as e:
+            self.log.info(f"Failed to get UUIDs for {device_address}: {e}")
+            return []
+
+    def connect_profile(self, address, profile_uuid):
+        """
+        Connect to a specific Bluetooth profile (e.g., A2DP Sink) on the remote device.
+
+        Args:
+            address: Bluetooth address of remote device.
+            profile_uuid: UUID of the Bluetooth profile to connect.
+
+        Returns:
+            True if the profile was connected, False otherwise.
+        """
+        device_path = self.find_device_path(address)
+        if not device_path:
+            self.log.info("Device path not found for address %s", address)
+            return False
+        try:
+            device = dbus.Interface(self.bus.get_object(constants.bluez_service, device_path),
+                                    constants.device_interface)
+            device.ConnectProfile(profile_uuid)
+            self.log.info("Profile %s successfully connected to %s", profile_uuid, address)
+            return True
+        except Exception as error:
+            self.log.error("Failed to connect profile %s: %s", profile_uuid, error)
+            return False
+
+    '''def handle_connect(self, device_address, selected_profiles, load_profiles):
+        self.device_profiles[device_address] = []
+        failed_profiles = []
+
+        for profile, role in selected_profiles.items():
+            if not self.profile_connection(device_address, profile, role):
+                failed_profiles.append(profile.upper())
+
+        # Prepare message
+        if not failed_profiles:
+            success = True
+            message = f"Connected profiles: {', '.join(self.device_profiles[device_address])}"
+        else:
+            success = False
+            message_parts = []
+            if self.device_profiles[device_address]:
+                message_parts.append(f"Successfully connected: {', '.join(self.device_profiles[device_address])}")
+            message_parts.append("Failed to connect:")
+            message_parts.extend(f" - {p}" for p in failed_profiles)
+            message = "\n".join(message_parts)
+
+        return success, message
+
+    def profile_connection(self, device_address, profile, role):
+        if device_address not in self.device_profiles:
+            self.device_profiles[device_address] = []
+        if profile == 'all':
+            if not self.connect(device_address):
+                return False
+
+            connected_uuids = self.get_connected_profile_uuids(device_address)
+            if (constants.profile_uuids["A2DP Sink"] in connected_uuids or
+                              constants.profile_uuids["A2DP Source"] in connected_uuids):
+                self.device_profiles[device_address].append("A2DP")
+
+            if constants.profile_uuids["OPP"] in connected_uuids:
+                opp_session = self.create_obex_session(device_address, "opp")
+                if not opp_session:
+                    return False
+                self.device_states.setdefault(device_address, {})["session_path"] = opp_session
+                self.device_profiles[device_address].append("OPP")
+
+            # PBAP session
+            if constants.profile_uuids.get("PBAP") in connected_uuids:
+                pbap_session = self.create_obex_session(device_address, "pbap")
+                self.select_phonebook(constants.location["internal"], constants.phonebook_types["phonebook"], pbap_session)
+                if not pbap_session:
+                    return False
+                self.device_states[device_address]["pbap_session"] = pbap_session
+                self.device_profiles[device_address].append("PBAP")
+
+            return True
+
+        elif profile == 'a2dp':
+            uuid = constants.profile_uuids["A2DP Sink"] if role == 'sink' else constants.profile_uuids["A2DP Source"]
+            if self.connect_profile(device_address, profile_uuid=uuid):
+                self.device_profiles[device_address].append("A2DP")
+                return True
+            return False
+
+        elif profile == 'opp':
+            session_path = self.create_obex_session(device_address, "opp")
+            if not session_path:
+                return False
+            self.device_states.setdefault(device_address, {})["session_path"] = session_path
+            self.device_profiles[device_address].append("OPP")
+            return True
+
+        elif profile == 'pbap':
+            session_path = self.create_obex_session(device_address, "pbap")
+            self.select_phonebook(constants.location["internal"], constants.phonebook_types["phonebook"], session_path)
+            if not session_path:
+                return False
+            self.device_states.setdefault(device_address, {})["pbap_session"] = session_path
+            self.device_profiles[device_address].append("PBAP")
+            return True'''
+
+    def handle_connect(self, device_address, selected_profiles, load_profiles):
+        self.device_profiles[device_address] = []
+        failed_profiles = []
+
+        for profile, role in selected_profiles.items():
+            result = self.profile_connection(device_address, profile, role)
+            failed_profiles.extend(result)
+
+        if not failed_profiles:
+            success = True
+            message = f"Connected profiles: {', '.join(self.device_profiles[device_address])}"
+        else:
+            success = False
+            message_parts = []
+            if self.device_profiles[device_address]:
+                message_parts.append(f"Successfully connected: {', '.join(self.device_profiles[device_address])}")
+            message_parts.append("Failed to connect:")
+            message_parts.extend(f" - {p}" for p in failed_profiles)
+            message = "\n".join(message_parts)
+
+        return success, message
+
+    def profile_connection(self, device_address, profile, role=None):
+        self.device_profiles.setdefault(device_address, [])
+        self.device_states.setdefault(device_address, {})
+
+        if profile == 'all':
+            failed = []
+
+            if not self.connect(device_address):
+                return ["A2DP", "OPP", "PBAP"]
+
+            connected_uuids = self.get_connected_profile_uuids(device_address)
+            if constants.profile_uuids["A2DP Sink"] in connected_uuids or constants.profile_uuids[
+                "A2DP Source"] in connected_uuids:
+                self.device_profiles[device_address].append("A2DP")
+            else:
+                failed.append("A2DP")
+
+            if constants.profile_uuids["OPP"] in connected_uuids:
+                opp_session = self.create_obex_session(device_address, "opp")
+                if opp_session:
+                    self.device_profiles[device_address].append("OPP")
+                    self.device_states[device_address]["session_path"] = opp_session
+                else:
+                    failed.append("OPP")
+            else:
+                failed.append("OPP")
+
+            if constants.profile_uuids.get("PBAP") in connected_uuids:
+                pbap_session = self.create_obex_session(device_address, "pbap")
+                if pbap_session:
+                    self.select_phonebook(constants.location["internal"], constants.phonebook_types["phonebook"], pbap_session)
+                    self.device_states[device_address]["pbap_session"] = pbap_session
+                    self.device_profiles[device_address].append("PBAP")
+                else:
+                    failed.append("PBAP")
+            else:
+                failed.append("PBAP")
+            return failed
+
+        elif profile == 'a2dp':
+            uuid = constants.profile_uuids["A2DP Sink"] if role == 'sink' else constants.profile_uuids["A2DP Source"]
+            if self.connect_profile(device_address, profile_uuid=uuid):
+                self.device_profiles[device_address].append("A2DP")
+                return []
+            return ["A2DP"]
+
+        elif profile == 'opp':
+            session_path = self.create_obex_session(device_address, "opp")
+            if session_path:
+                self.device_profiles[device_address].append("OPP")
+                self.device_states[device_address]["session_path"] = session_path
+                return []
+            return ["OPP"]
+
+        elif profile == 'pbap':
+            session_path = self.create_obex_session(device_address, "pbap")
+            if session_path:
+                self.select_phonebook(constants.location["internal"], constants.phonebook_types["phonebook"], session_path)
+                self.device_profiles[device_address].append("PBAP")
+                self.device_states[device_address]["pbap_session"] = session_path
+                return []
+            return ["PBAP"]
+
+    '''def handle_connect(self, device_address, selected_profiles, load_profiles):
+        self.device_profiles[device_address] = []
+        failed_profiles = []
+        errors = {}
+
+        if 'all' in selected_profiles:
+            profiles_to_connect = ['all']
+        else:
+            profiles_to_connect = list(selected_profiles.keys())
+
+        for profile in profiles_to_connect:
+            role = selected_profiles.get(profile)
+            if not self.profile_connection(device_address, profile, role):
+                failed_profiles.append(profile.upper())
+                errors[profile.lower()] = "Unknown error"
+
+        if failed_profiles:
+            if self.device_profiles[device_address]:
+                # Partial success
+                message_parts = [f"Successfully connected: {', '.join(self.device_profiles[device_address])}"]
+            else:
+                message_parts = []
+
+            message_parts.append("Failed to connect:")
+            message_parts.extend(f" - {p}: {errors.get(p.lower(), 'Unknown error')}" for p in failed_profiles)
+            message = "\n".join(message_parts)
+            success = len(self.device_profiles[device_address]) > 0
+        else:
+            # All success
+            message = f"Connected profiles: {', '.join(self.device_profiles[device_address])}"
+            success = True
+
+        return success, message
+
+    def profile_connection(self, device_address, profile, role=None):
+        self.device_profiles.setdefault(device_address, [])
+
+        print("profile:", profile)
+        if profile == 'all':
+            return self.connect_all_profiles(device_address)
+
+        # Map profile names to UUIDs
+        profile_uuid_map = {
+            'a2dp': [constants.profile_uuids["A2DP Sink"], constants.profile_uuids["A2DP Source"]],
+            'opp': [constants.profile_uuids["OPP"]],
+            'pbap': [constants.profile_uuids.get("PBAP")],
+        }
+
+        if profile not in profile_uuid_map:
+            return False
+
+        connected_uuids = self.get_connected_profile_uuids(device_address)
+
+        if profile == 'a2dp':
+            if constants.profile_uuids["A2DP Sink"] in connected_uuids:
+                role = 'sink'
+            elif constants.profile_uuids["A2DP Source"] in connected_uuids:
+                role = 'source'
+            else:
+                return False
+
+        return self.connect_specific_profile(device_address, profile, role)
+
+    def connect_all_profiles(self, device_address):
+        if not self.connect(device_address):
+            return False
+        connected_uuids = self.get_connected_profile_uuids(device_address)
+        if constants.profile_uuids["A2DP Sink"] in connected_uuids or constants.profile_uuids["A2DP Source"] in connected_uuids:
+            self.device_profiles[device_address].append("A2DP")
+        if constants.profile_uuids["OPP"] in connected_uuids:
+            session_path = self.create_obex_session(device_address, "opp")
+            if not session_path:
+                return False
+            self.device_states.setdefault(device_address, {})["session_path"] = session_path
+            self.device_profiles[device_address].append("OPP")
+        if constants.profile_uuids.get("PBAP") in connected_uuids:
+            session_path = self.create_obex_session(device_address, "pbap")
+            if not session_path:
+                return False
+            self.device_states[device_address]["pbap_session"] = session_path
+            self.device_profiles[device_address].append("PBAP")
+        return True
+
+    def connect_specific_profile(self, device_address, profile, role):
+        if profile == 'a2dp':
+            uuid = constants.profile_uuids["A2DP Sink"] if role == 'sink' else constants.profile_uuids["A2DP Source"]
+            if self.connect_profile(device_address, profile_uuid=uuid):
+                self.device_profiles[device_address].append("A2DP")
+                return True
+        elif profile == 'opp':
+            session_path = self.create_obex_session(device_address, "opp")
+            if session_path:
+                self.device_states.setdefault(device_address, {})["session_path"] = session_path
+                self.device_profiles[device_address].append("OPP")
+                return True
+        elif profile == 'pbap':
+            session_path = self.create_obex_session(device_address, "pbap")
+            if session_path:
+                self.device_states.setdefault(device_address, {})["pbap_session"] = session_path
+                self.device_profiles[device_address].append("PBAP")
+                return True
+        return False'''
+
+    def handle_disconnect(self, device_address):
+        state = self.device_states.get(device_address, {})
+        session_path = state.get("session_path")
+        pbap_session = state.get("pbap_session")
+        opp_connected = "OPP" in self.device_profiles.get(device_address, [])
+        pbap_connected = "PBAP" in self.device_profiles.get(device_address, [])
+        a2dp_connected = "A2DP" in self.device_profiles.get(device_address, [])
+        bluetooth_connected = self.is_device_connected(device_address)
+        bt_success = True
+
+        if opp_connected and session_path:
+            self.remove_obex_session(session_path)
+            state["session_path"] = None
+            self.device_states[device_address] = state
+
+        if pbap_connected and pbap_session:
+            self.remove_obex_session(pbap_session)
+            state["pbap_session"] = None
+            self.device_states[device_address] = state
+
+        if a2dp_connected or bluetooth_connected:
+            bt_success = self.disconnect(device_address)
+
+        # Clean up device state
+        self.device_profiles.pop(device_address, None)
+        self.device_states.pop(device_address, None)
+
+        return bt_success
+
+    def select_phonebook(self, location, phonebook_type, session_path=None):
+        """ Select the phonebook object  to interact with.
+        Args:
+        location: Phonebook storage location (e.g., "int"(internal which is default), "sim1" and "sim2")
+        phonebook_type: Phonebook type (e.g., "pb", "ich", "och", "mch", "cch", "spd", "fav")
+
+        Returns:
+            True if phonebook was selected successfully, False otherwise. """
+        pbap_interface = dbus.Interface(
+            self.session_bus.get_object(constants.obex_service, session_path),
+            constants.obex_pbap_interface
+        )
+        if not pbap_interface:
+            self.log.error(" Phonebook interface not initialized.")
+            return False
+        try:
+            pbap_interface.Select(location, phonebook_type)
+            self.log.debug(f"Selected {location}/{phonebook_type} phonebook.")
+            return True
+        except dbus.exceptions.DBusException:
+            return False
+
+    def pull_single_contact(self, device_address, contact_name, session_path=None, save_path=None):
+        """Pull a single vCard from the remote device via PBAP."""
+        try:
+            if not session_path:
+                session_path = self.create_obex_session(device_address, profile="pbap")
+
+            pbap_interface = dbus.Interface(
+                self.session_bus.get_object(constants.obex_service, session_path),
+                constants.obex_pbap_interface
+            )
+
+            transfer_path, _ = pbap_interface.Pull(contact_name, save_path, {})
+
+            self.transfer_status = {"status": "unknown"}
+            self.session_bus.add_signal_receiver(
+                self.obex_properties_changed,
+                dbus_interface=constants.properties_interface,
+                signal_name="PropertiesChanged",
+                arg0=constants.obex_object_transfer,
+                path=transfer_path,
+                path_keyword="path"
+            )
+
+            self.transfer_loop = GLib.MainLoop()
+            self.transfer_loop.run()
+
+            return self.transfer_status["status"]
+        except Exception as e:
+            self.log.info("PBAP single contact pull failed: %s", e)
+            return "error"
+
+    def pull_all_contacts(self, device_address, save_path, session_path):
+        """Pull all contacts from the remote device via PBAP."""
+        try:
+            if not session_path:
+                session_path = self.create_obex_session(device_address, profile="pbap")
+
+            pbap_interface = dbus.Interface(
+                self.session_bus.get_object(constants.obex_service, session_path),
+                constants.obex_pbap_interface
+            )
+            transfer_path, _ = pbap_interface.PullAll(save_path, {})
+
+            self.transfer_status = {"status": "unknown"}
+            self.session_bus.add_signal_receiver(
+                self.obex_properties_changed,
+                dbus_interface=constants.properties_interface,
+                signal_name="PropertiesChanged",
+                arg0=constants.obex_object_transfer,
+                path=transfer_path,
+                path_keyword="path"
+            )
+
+            self.transfer_loop = GLib.MainLoop()
+            self.transfer_loop.run()
+
+            return self.transfer_status["status"]
+        except Exception as e:
+            self.log.info("PBAP pull all contacts failed: %s", e)
+            return "error"
+
+    '''def create_gatt_client(self):
+        found = False
+        timeout = 30
+        while timeout > 0:
+            device_path = get_device_path_by_address(self.object_manager, self.device_address)
+            if device_path:
+                self.log.info("Found target device at %s", device_path)
+                found = True
+                break
+            time.sleep(2)
+            timeout -= 2
+
+        if not found:
+            self.log.error("Error getting device path: %s", e)
+            return
+        self.log.info("Discovering characteristics...")
+        time.sleep(2)
+        chars = find_characteristics(self.object_manager, device_path)
+
+        battery_level_char = chars.get(constants.battery_level_uuid)
+        battery_level_status = chars.get(constants.battery_status_level_uuid)
+
+        if battery_level_char:
+            start_notify(self.bus, battery_level_char, 'Battery Level')
+        else:
+            self.log.warning("Battery Level characteristic not found")
+
+        if battery_level_status:
+            battery_status_level(battery_level_status)
+            start_notify(self.bus, battery_level_status, 'Battery Critical Status', battery_status_level)
+        else:
+            self.log.warning("Battery Level Critical characteristic not found")
+
+        self.log.info("Waiting for Battery level notifications…")
+        GLib.MainLoop().run()'''
+
+    def create_gatt_client(self):
+        found = False
+        timeout = 30
+        while timeout > 0:
+            device_path = get_device_path_by_address(self.object_manager, self.device_address)
+            if device_path:
+                self.log.info("Found target device at %s", device_path)
+                found = True
+                break
+            time.sleep(2)
+            timeout -= 2
+
+        if not found:
+            self.log.error("Error getting device path: %s", "Device not found")
+            return
+
+        self.log.info("Discovering characteristics...")
+        time.sleep(2)
+        chars = find_characteristics(self.object_manager, device_path)
+
+        self.battery_level_char = chars.get(constants.battery_level_uuid)
+        print(self.battery_level_char)
+        self.battery_status_char = chars.get(constants.battery_status_level_uuid)
+        print(self.battery_status_char)
+
+        if self.battery_level_char:
+            self.log.info("Battery Level characteristic found")
+        else:
+            self.log.warning("Battery Level characteristic not found")
+
+        if self.battery_status_char:
+            self.log.info("Battery Status characteristic found")
+        else:
+            self.log.warning("Battery Status characteristic not found")
+

@@ -1,0 +1,331 @@
+
+# ------------------------------
+# Phone Alert Status Service (PASS) - UUID 0x180E
+# ------------------------------
+
+class PhoneAlertStatusService(dbus.service.Object):
+    """Phone Alert Status Service (UUID 0x180E)"""
+    def __init__(self, bus, index, mainloop):
+        # Follow your service path convention
+        self.path = constants.service_path + f"_pass_service{index}"
+        self.bus = bus
+        self.uuid = constants.phone_alert_status_service_uuid  # "180E"
+        self.primary = True
+        self.mainloop = mainloop
+
+        # Internal state shared across characteristics
+        # Alert Status bits: bit0=Ringer, bit1=Vibrate, bit2=Display
+        self.alert_status = 0x00  # start with all off
+        self.ringer_setting = 0x01  # 0x00=Silent, 0x01=Normal
+
+        self.characteristics = []
+        dbus.service.Object.__init__(self, bus, self.path)
+
+        # Create characteristics
+        self.alert_status_char = AlertStatusCharacteristic(bus, 0, self, mainloop)
+        self.characteristics.append(self.alert_status_char)
+
+        self.ringer_setting_char = RingerSettingCharacteristic(bus, 1, self, mainloop)
+        self.characteristics.append(self.ringer_setting_char)
+
+        self.ringer_cp_char = RingerControlPointCharacteristic(bus, 2, self)
+        self.characteristics.append(self.ringer_cp_char)
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def get_properties(self):
+        return {
+            constants.gatt_service_interface: {
+                "UUID": self.uuid,
+                "Primary": dbus.Boolean(self.primary),
+                "Characteristics": dbus.Array(
+                    [c.get_path() for c in self.characteristics],
+                    signature="o"
+                )
+            }
+        }
+
+    def get_characteristics(self):
+        return self.characteristics
+
+
+class PASSCCCDDescriptor(dbus.service.Object):
+    """Generic CCCD for PASS notify characteristics"""
+    def __init__(self, bus, index, characteristic):
+        self.path = characteristic.get_path() + f"/desc{index}"
+        self.bus = bus
+        self.characteristic = characteristic
+        self.uuid = constants.client_characteristic_config_uuid  # CCCD 0x2902
+        self.flags = ['read', 'write']
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def get_properties(self):
+        return {
+            constants.gatt_descriptor_interface: {
+                "UUID": self.uuid,
+                "Characteristic": self.characteristic.get_path(),
+                "Flags": dbus.Array(self.flags, signature='s'),
+            }
+        }
+
+    @dbus.service.method(constants.gatt_descriptor_interface,
+                         in_signature='a{sv}', out_signature='ay')
+    def ReadValue(self, options):
+        # Return default (notifications disabled)
+        return [dbus.Byte(0x00), dbus.Byte(0x00)]
+
+    @dbus.service.method(constants.gatt_descriptor_interface,
+                         in_signature='aya{sv}', out_signature='')
+    def WriteValue(self, value, options):
+        if len(value) != 2:
+            log.warning("[PASS] CCCD Write invalid len")
+            return
+        cccd_value = value[0] | (value[1] << 8)
+        if cccd_value == 0x0001:
+            self.characteristic.StartNotify()
+        elif cccd_value == 0x0000:
+            self.characteristic.StopNotify()
+        else:
+            log.warning(f"[PASS] Unknown CCCD value: {cccd_value}")
+
+
+class AlertStatusCharacteristic(dbus.service.Object):
+    """Alert Status (UUID 0x2A3F) - Read, Notify; bit0=Ringer, bit1=Vibrate, bit2=Display"""
+    def __init__(self, bus, index, service, mainloop):
+        self.path = service.get_path() + f"/char{index}"
+        self.bus = bus
+        self.service = service
+        self.uuid = constants.alert_status_uuid  # "2A3F"
+        self.flags = ['read', 'notify']
+        self.notifying = False
+        self.mainloop = mainloop
+        dbus.service.Object.__init__(self, bus, self.path)
+
+        # CCCD for notifications
+        self.descriptor = PASSCCCDDescriptor(bus, 0, self)
+
+        # Periodic toggling while notifying (simulated)
+        self.notify_interval_ms = 4000
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def get_properties(self):
+        return {
+            constants.gatt_characteristic_interface: {
+                "UUID": self.uuid,
+                "Service": self.service.get_path(),
+                "Flags": dbus.Array(self.flags, signature='s'),
+                "Descriptors": dbus.Array([self.descriptor.get_path()], signature='o')
+            }
+        }
+
+    @dbus.service.method(constants.gatt_characteristic_interface,
+                         in_signature='a{sv}', out_signature='ay')
+    def ReadValue(self, options):
+        value = self.service.alert_status & 0x07  # only 3 bits defined
+        log.info(f"[PASS] Alert Status read: 0b{value:03b}")
+        return [dbus.Byte(value)]
+
+    @dbus.service.method(constants.gatt_characteristic_interface,
+                         in_signature='', out_signature='')
+    def StartNotify(self):
+        if self.notifying:
+            return
+        self.notifying = True
+        log.info("[PASS] Alert Status notifications started")
+        GLib.timeout_add(self.notify_interval_ms, self._notify_loop)
+
+    @dbus.service.method(constants.gatt_characteristic_interface,
+                         in_signature='', out_signature='')
+    def StopNotify(self):
+        if not self.notifying:
+            return
+        self.notifying = False
+        log.info("[PASS] Alert Status notifications stopped")
+
+    def set_alert_status(self, new_bits):
+        """Update the status bits (0..7) and notify if enabled."""
+        self.service.alert_status = new_bits & 0x07
+        if self.notifying:
+            self._emit_value()
+
+    def _emit_value(self):
+        val = [dbus.Byte(self.service.alert_status & 0x07)]
+        self.PropertiesChanged(constants.gatt_characteristic_interface, {"Value": val}, [])
+
+    def _notify_loop(self):
+        if not self.notifying:
+            return False
+        # Simulate status changes: randomly toggle one of the three bits
+        bit = random.choice([0, 1, 2])
+        self.service.alert_status ^= (1 << bit)
+        log.debug(f"[PASS] Alert Status notify: 0b{self.service.alert_status & 0x07:03b}")
+        self._emit_value()
+        return True
+
+    @dbus.service.signal("org.freedesktop.DBus.Properties", signature="sa{sv}as")
+    def PropertiesChanged(self, interface, changed, invalidated):
+        pass
+
+
+class RingerSettingCharacteristic(dbus.service.Object):
+    """Ringer Setting (UUID 0x2A41) - Read, Notify; 0x00=Silent, 0x01=Normal"""
+    def __init__(self, bus, index, service, mainloop):
+        self.path = service.get_path() + f"/char{index}"
+        self.bus = bus
+        self.service = service
+        self.uuid = constants.ringer_setting_uuid  # "2A41"
+        self.flags = ['read', 'notify']
+        self.notifying = False
+        self.mainloop = mainloop
+        dbus.service.Object.__init__(self, bus, self.path)
+
+        self.descriptor = PASSCCCDDescriptor(bus, 0, self)
+        self.notify_interval_ms = 8000  # slower changes than Alert Status
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def get_properties(self):
+        return {
+            constants.gatt_characteristic_interface: {
+                "UUID": self.uuid,
+                "Service": self.service.get_path(),
+                "Flags": dbus.Array(self.flags, signature='s'),
+                "Descriptors": dbus.Array([self.descriptor.get_path()], signature='o')
+            }
+        }
+
+    @dbus.service.method(constants.gatt_characteristic_interface,
+                         in_signature='a{sv}', out_signature='ay')
+    def ReadValue(self, options):
+        val = self.service.ringer_setting & 0x01
+        log.info(f"[PASS] Ringer Setting read: {'Normal' if val == 0x01 else 'Silent'}")
+        return [dbus.Byte(val)]
+
+    @dbus.service.method(constants.gatt_characteristic_interface,
+                         in_signature='', out_signature='')
+    def StartNotify(self):
+        if self.notifying:
+            return
+        self.notifying = True
+        log.info("[PASS] Ringer Setting notifications started")
+        GLib.timeout_add(self.notify_interval_ms, self._notify_loop)
+
+    @dbus.service.method(constants.gatt_characteristic_interface,
+                         in_signature='', out_signature='')
+    def StopNotify(self):
+        if not self.notifying:
+            return
+        self.notifying = False
+        log.info("[PASS] Ringer Setting notifications stopped")
+
+    def set_ringer_setting(self, new_val):
+        """Update 0x00/0x01 and notify if enabled."""
+        self.service.ringer_setting = 0x01 if new_val else 0x00
+        if self.notifying:
+            self._emit_value()
+
+    def _emit_value(self):
+        val = [dbus.Byte(self.service.ringer_setting & 0x01)]
+        self.PropertiesChanged(constants.gatt_characteristic_interface, {"Value": val}, [])
+
+    def _notify_loop(self):
+        if not self.notifying:
+            return False
+        # Simulate mode flip
+        self.service.ringer_setting ^= 0x01
+        log.debug(f"[PASS] Ringer Setting notify: {'Normal' if self.service.ringer_setting == 1 else 'Silent'}")
+        self._emit_value()
+        return True
+
+    @dbus.service.signal("org.freedesktop.DBus.Properties", signature="sa{sv}as")
+    def PropertiesChanged(self, interface, changed, invalidated):
+        pass
+
+
+class RingerControlPointCharacteristic(dbus.service.Object):
+    """Ringer Control Point (UUID 0x2A40) - Write Without Response"""
+    def __init__(self, bus, index, service):
+        self.path = service.get_path() + f"/char{index}"
+        self.bus = bus
+        self.service = service
+        self.uuid = constants.ringer_control_point_uuid  # "2A40"
+        self.flags = ['write-without-response']
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_path(self):
+        return dbus.ObjectPath(self.path)
+
+    def get_properties(self):
+        return {
+            constants.gatt_characteristic_interface: {
+                "UUID": self.uuid,
+                "Service": self.service.get_path(),
+                "Flags": dbus.Array(self.flags, signature='s')
+            }
+        }
+
+    @dbus.service.method(constants.gatt_characteristic_interface,
+                         in_signature='aya{sv}', out_signature='')
+    def WriteValue(self, value, options):
+        if not value:
+            log.warning("[PASS] Ringer Control Point write: empty")
+            return
+
+        cmd = int(value[0])
+        # 0x01 Silent Mode, 0x02 Mute Once, 0x03 Cancel Silent Mode
+        if cmd == 0x01:
+            log.info("[PASS] RCP: Silent Mode")
+            # Set ringer to silent and clear 'ringer state' bit
+            self.service.ringer_setting = 0x00
+            self.service.alert_status &= ~(1 << 0)
+            self._emit_updates()
+        elif cmd == 0x02:
+            log.info("[PASS] RCP: Mute Once")
+            # Temporarily clear 'ringer state' bit
+            self.service.alert_status &= ~(1 << 0)
+            self._emit_updates()
+            # Restore after a short delay to simulate "once"
+            def restore():
+                self.service.alert_status |= (1 << 0)
+                self._emit_updates()
+                return False
+            GLib.timeout_add(3000, restore)
+        elif cmd == 0x03:
+            log.info("[PASS] RCP: Cancel Silent Mode")
+            # Back to normal ringer; set ringer state bit on
+            self.service.ringer_setting = 0x01
+            self.service.alert_status |= (1 << 0)
+            self._emit_updates()
+        else:
+            log.warning(f"[PASS] RCP: Unknown command 0x{cmd:02X}")
+
+    def _emit_updates(self):
+        # Push changes through the two notifying characteristics if enabled
+        try:
+            self.service.ringer_setting_char._emit_value()
+        except Exception:
+            pass
+        try:
+            self.service.alert_status_char._emit_value()
+        except Exception:
+            pass
+
+
+
+# Services
+phone_alert_status_service_uuid = "180E"
+
+# Characteristics
+alert_status_uuid = "2A3F"
+ringer_setting_uuid = "2A41"
+ringer_control_point_uuid = "2A40"
+
+# CCCD already present in your file:
+# client_characteristic_config_uuid = "2902"

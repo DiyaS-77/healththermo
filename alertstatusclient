@@ -1,0 +1,253 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import sys
+import time
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+# Assigned Numbers (16-bit)
+UUID_PASS_SERVICE = "0000180e-0000-1000-8000-00805f9b34fb"
+UUID_ALERT_STATUS = "00002a3f-0000-1000-8000-00805f9b34fb"
+UUID_RINGER_SETTING = "00002a41-0000-1000-8000-00805f9b34fb"
+UUID_RINGER_CONTROL_POINT = "00002a40-0000-1000-8000-00805f9b34fb"
+
+BLUEZ_SERVICE = "org.bluez"
+OBJM_IFACE = "org.freedesktop.DBus.ObjectManager"
+DEV_IFACE = "org.bluez.Device1"
+CHAR_IFACE = "org.bluez.GattCharacteristic1"
+PROP_IFACE = "org.freedesktop.DBus.Properties"
+ADAPTER_IFACE = "org.bluez.Adapter1"
+
+
+def find_adapter(bus, hci="hci0"):
+    path = f"/org/bluez/{hci}"
+    try:
+        bus.get_object(BLUEZ_SERVICE, path)
+        return path
+    except dbus.exceptions.DBusException as e:
+        raise RuntimeError(f"Adapter {hci} not found: {e}")
+
+
+def get_managed_objects(bus):
+    obj = bus.get_object(BLUEZ_SERVICE, "/")
+    mgr = dbus.Interface(obj, OBJM_IFACE)
+    return mgr.GetManagedObjects()
+
+
+def find_device_path(bus, adapter_path, address):
+    """Return the DBus object path for a device with the given address (case-insensitive)."""
+    m = get_managed_objects(bus)
+    address = address.upper()
+    for path, ifaces in m.items():
+        dev = ifaces.get(DEV_IFACE)
+        if not dev:
+            continue
+        if str(dev.get("Adapter")) != adapter_path:
+            continue
+        if str(dev.get("Address", "")).upper() == address:
+            return path
+    return None
+
+
+def device_interface(bus, dev_path):
+    dev_obj = bus.get_object(BLUEZ_SERVICE, dev_path)
+    return dbus.Interface(dev_obj, DEV_IFACE), dbus.Interface(dev_obj, PROP_IFACE)
+
+
+def ensure_connected(dev_if, prop_if):
+    connected = bool(prop_if.Get(DEV_IFACE, "Connected"))
+    if not connected:
+        dev_if.Connect()
+        # give it a moment to complete
+        for _ in range(50):
+            if bool(prop_if.Get(DEV_IFACE, "Connected")):
+                break
+            time.sleep(0.1)
+    if not bool(prop_if.Get(DEV_IFACE, "Connected")):
+        raise RuntimeError("Failed to connect to device")
+
+
+def start_service_discovery(dev_if, prop_if, timeout_s=10):
+    # On BlueZ 5.x, services are typically resolved on connect, but we can trigger explicitly
+    discovering = bool(prop_if.Get(DEV_IFACE, "ServicesResolved"))
+    if discovering:
+        return
+    for _ in range(int(timeout_s * 10)):
+        if bool(prop_if.Get(DEV_IFACE, "ServicesResolved")):
+            return
+        time.sleep(0.1)
+    raise RuntimeError("GATT services not resolved in time")
+
+
+def find_characteristic_paths(bus, dev_path, uuids):
+    """Return dict uuid->char_path for the given list of UUIDs (128-bit lower-case)."""
+    result = {}
+    m = get_managed_objects(bus)
+    want = set(u.lower() for u in uuids)
+    for path, ifaces in m.items():
+        if path.startswith(dev_path) and CHAR_IFACE in ifaces:
+            c_uuid = str(ifaces[CHAR_IFACE].get("UUID")).lower()
+            if c_uuid in want:
+                result[c_uuid] = path
+    return result
+
+
+def read_char(bus, char_path):
+    char_obj = bus.get_object(BLUEZ_SERVICE, char_path)
+    char = dbus.Interface(char_obj, CHAR_IFACE)
+    return bytes(char.ReadValue({}))
+
+
+def start_notify(bus, char_path):
+    char_obj = bus.get_object(BLUEZ_SERVICE, char_path)
+    char = dbus.Interface(char_obj, CHAR_IFACE)
+    char.StartNotify()
+
+
+def stop_notify(bus, char_path):
+    char_obj = bus.get_object(BLUEZ_SERVICE, char_path)
+    char = dbus.Interface(char_obj, CHAR_IFACE)
+    try:
+        char.StopNotify()
+    except Exception:
+        pass
+
+
+def write_rcp(bus, char_path, command_byte):
+    """Write Without Response to Ringer Control Point (0x2A40)."""
+    char_obj = bus.get_object(BLUEZ_SERVICE, char_path)
+    char = dbus.Interface(char_obj, CHAR_IFACE)
+    char.WriteValue(dbus.Array([dbus.Byte(command_byte)], signature='y'), {})
+
+
+def on_properties_changed(interface, changed, invalidated, char_lookup):
+    # Only handle characteristic value changes
+    if interface != CHAR_IFACE:
+        return
+    if "Value" not in changed:
+        return
+    sender = dbus.get_current_message().get_path()  # DBus message path for this signal
+    value = bytes(changed["Value"])
+    # Identify which characteristic we got
+    label = char_lookup.get(sender, sender)
+    if label == "AlertStatus":
+        if len(value) >= 1:
+            b = value[0]
+            ringer = 1 if (b & 0x01) else 0
+            vibrate = 1 if (b & 0x02) else 0
+            display = 1 if (b & 0x04) else 0
+            print(f"[Notify] Alert Status: bits=0b{b:03b} "
+                  f"(ringer={ringer}, vibrate={vibrate}, display={display})")
+        else:
+            print(f"[Notify] Alert Status: <empty>")
+    elif label == "RingerSetting":
+        if len(value) >= 1:
+            print(f"[Notify] Ringer Setting: {'Normal(1)' if value[0] == 1 else 'Silent(0)'}")
+        else:
+            print(f"[Notify] Ringer Setting: <empty>")
+    else:
+        print(f"[Notify] {label}: {value.hex()}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <PEER_BLE_ADDRESS> [hciX]")
+        print("Example:", f"{sys.argv[0]} C0:FF:EE:C0:FF:EE hci0")
+        sys.exit(1)
+
+    target_addr = sys.argv[1]
+    hci = sys.argv[2] if len(sys.argv) > 2 else "hci0"
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+
+    adapter_path = find_adapter(bus, hci)
+    dev_path = find_device_path(bus, adapter_path, target_addr)
+    if not dev_path:
+        raise RuntimeError(f"Device {target_addr} not found under {hci}. "
+                           f"First pair/scan using bluetoothctl or ensure it is advertising.")
+
+    dev_if, prop_if = device_interface(bus, dev_path)
+
+    print("[*] Connecting…")
+    ensure_connected(dev_if, prop_if)
+    print("[*] Connected.")
+
+    print("[*] Waiting for GATT services to resolve…")
+    start_service_discovery(dev_if, prop_if)
+    print("[*] Services resolved.")
+
+    # Locate PASS chars
+    wanted = [UUID_ALERT_STATUS, UUID_RINGER_SETTING, UUID_RINGER_CONTROL_POINT]
+    char_paths = find_characteristic_paths(bus, dev_path, wanted)
+
+    if UUID_ALERT_STATUS not in char_paths or \
+       UUID_RINGER_SETTING not in char_paths or \
+       UUID_RINGER_CONTROL_POINT not in char_paths:
+        raise RuntimeError("Could not find all PASS characteristics on the device.")
+
+    alert_path = char_paths[UUID_ALERT_STATUS]
+    setting_path = char_paths[UUID_RINGER_SETTING]
+    rcp_path = char_paths[UUID_RINGER_CONTROL_POINT]
+
+    # Read initial values
+    try:
+        a0 = read_char(bus, alert_path)
+        s0 = read_char(bus, setting_path)
+        print(f"[Read] Alert Status init: 0x{a0[0]:02X} (bits ringer/vibrate/display)")
+        print(f"[Read] Ringer Setting init: {s0[0]} ({'Normal' if s0[0]==1 else 'Silent'})")
+    except dbus.exceptions.DBusException as e:
+        print(f"[!] Read failed: {e}")
+
+    # Subscribe to notifications
+    char_labels = {
+        alert_path: "AlertStatus",
+        setting_path: "RingerSetting",
+    }
+
+    bus.add_signal_receiver(
+        lambda interface, changed, invalidated:
+            on_properties_changed(interface, changed, invalidated, char_labels),
+        dbus_interface=PROP_IFACE,
+        signal_name="PropertiesChanged",
+        path_keyword=None  # we’ll fetch sender path inside
+    )
+
+    print("[*] Enabling notifications for Alert Status & Ringer Setting…")
+    start_notify(bus, alert_path)
+    start_notify(bus, setting_path)
+
+    # Demonstrate RCP writes
+    print("[*] Sending Ringer Control Point commands...")
+    print("    -> Silent Mode (0x01)")
+    write_rcp(bus, rcp_path, 0x01)
+    time.sleep(2)
+
+    print("    -> Mute Once (0x02)")
+    write_rcp(bus, rcp_path, 0x02)
+    time.sleep(5)
+
+    print("    -> Cancel Silent Mode (0x03)")
+    write_rcp(bus, rcp_path, 0x03)
+    time.sleep(1)
+
+    print("[*] Entering main loop. Press Ctrl+C to quit.")
+    loop = GLib.MainLoop()
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        print("\n[*] Stopping notifications and disconnecting…")
+    finally:
+        stop_notify(bus, alert_path)
+        stop_notify(bus, setting_path)
+        try:
+            dev_if.Disconnect()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

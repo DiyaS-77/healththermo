@@ -1,0 +1,2202 @@
+import os
+import re
+import dbus
+
+from PyQt6.QtCore import QCoreApplication
+from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QFileSystemWatcher
+from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QFont
+from PyQt6.QtWidgets import QCheckBox, QInputDialog
+from PyQt6.QtWidgets import QComboBox
+from PyQt6.QtWidgets import QDialog
+from PyQt6.QtWidgets import QDialogButtonBox
+from PyQt6.QtWidgets import QFileDialog
+from PyQt6.QtWidgets import QGridLayout
+from PyQt6.QtWidgets import QGroupBox
+from PyQt6.QtWidgets import QHeaderView
+from PyQt6.QtWidgets import QHBoxLayout
+from PyQt6.QtWidgets import QLabel
+from PyQt6.QtWidgets import QLayout
+from PyQt6.QtWidgets import QLineEdit
+from PyQt6.QtWidgets import QListWidget
+from PyQt6.QtWidgets import QListWidgetItem
+from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtWidgets import QPushButton
+from PyQt6.QtWidgets import QRadioButton
+from PyQt6.QtWidgets import QSizePolicy
+from PyQt6.QtWidgets import QSlider
+from PyQt6.QtWidgets import QTabWidget
+from PyQt6.QtWidgets import QTableWidget
+from PyQt6.QtWidgets import QTableWidgetItem
+from PyQt6.QtWidgets import QTabWidget
+from PyQt6.QtWidgets import QTextEdit
+from PyQt6.QtWidgets import QVBoxLayout
+from PyQt6.QtWidgets import QWidget
+from PyQt6.QtWidgets import QCheckBox, QInputDialog, QToolButton, QGraphicsDropShadowEffect
+from PyQt6.QtCore import  QParallelAnimationGroup, QEasingCurve, QPropertyAnimation
+
+import style_sheet as styles
+from libraries.bluetooth import constants
+from libraries.bluetooth.bluez_gatt import BluetoothDeviceManager
+from Utils.utils import get_controller_interface_details
+from Utils.utils import validate_bluetooth_address
+
+
+class TestApplication(QWidget):
+    """Main GUI class for the Bluetooth Test Host."""
+
+    def __init__(self, interface=None, back_callback=None, log=None, bluetoothd_log_file_path=None, pulseaudio_log_file_path=None, obexd_log_file_path=None, ofonod_log_file_path=None, hcidump_log_name=None):
+        """Initialize the Test Host widget.
+
+        Args:
+            interface: Bluetooth adapter interface (e.g., hci0).
+            back_callback: Optional callback to trigger on back action.
+            log: Logger instance used for logging.
+             bluetoothd_log_file_path: Path to bluetoothd log.
+            pulseaudio_log_file_path: Path to PulseAudio log.
+            obexd_log_file_path: Path to obexd log.
+            ofonod_log_file_path: Path to ofonod log.
+            hcidump_log_name: Name of hcidump log file.
+        """
+        super().__init__()
+        self.interface = interface
+        self.log_path = log.log_path
+        self.log = log
+        self.bluetoothd_log_file_path = bluetoothd_log_file_path
+        self.pulseaudio_log_file_path = pulseaudio_log_file_path
+        self.obexd_log_file_path = obexd_log_file_path
+        self.ofonod_log_file_path = ofonod_log_file_path
+        self.hcidump_log_name = hcidump_log_name
+        self.back_callback = back_callback
+        self.bluetooth_device_manager = BluetoothDeviceManager(log=self.log, interface=self.interface)
+        self.paired_devices = {}
+        self.main_grid_layout = None
+        self.gap_button = None
+        self.device_tab_widget = None
+        self.device_profiles = {}
+        self.grid = None
+        self.playback_timer = None
+        self.profile_methods_layout = None
+        self.profile_methods_widget = None
+        self.profiles_list_widget = None
+        self.profile_description_text_browser = None
+        self.refresh_button = None
+        self.selected_profiles = {}
+        self.device_tabs_map = {}
+        self.audio_playlist_data = {}
+        self.device_streaming_status = {}
+        #self.device_states = {}
+        self.hfp_sections = []
+
+        self.initialize_host_ui()
+
+    def load_paired_devices(self):
+        """Loads and displays all paired Bluetooth devices into the profiles list widget."""
+        list_index = self.profiles_list_widget.count() - 1
+        self.paired_devices = self.bluetooth_device_manager.get_paired_devices()
+        unique_devices = set(self.paired_devices.keys())
+        for device_address in unique_devices:
+            device_item = QListWidgetItem(device_address)
+            device_item.setFont(QFont("Courier New", 10))
+            device_item.setForeground(Qt.GlobalColor.black)
+            list_index += 1
+            self.profiles_list_widget.insertItem(list_index, device_item)
+
+    def add_controller_details_row(self, row, label, value):
+        """Adds a new row to the controller details grid layout.
+
+        Args:
+            row: The row index in the grid layout where this entry should be placed.
+            label: The text label to describe the data.
+            value: The corresponding value to display alongside the label.
+        """
+        label_widget = QLabel(label)
+        label_widget.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        label_widget.setObjectName("label_widget")
+        label_widget.setStyleSheet(styles.color_style_sheet)
+        value_widget = QLabel(value)
+        value_widget.setObjectName("value_widget")
+        value_widget.setFont(QFont("Arial", 10))
+        value_widget.setStyleSheet(styles.color_style_sheet)
+        self.grid.addWidget(label_widget, row, 0)
+        self.grid.addWidget(value_widget, row, 1)
+
+    def set_discoverable_mode(self, enable):
+        """Enable or disable discoverable mode on the Bluetooth adapter.
+
+        Args:
+            enable: True to enable, False to disable.
+        """
+        if enable:
+            self.set_discoverable_on_button.setEnabled(False)
+            self.set_discoverable_off_button.setEnabled(True)
+            self.bluetooth_device_manager.set_discoverable_mode(True)
+            timeout = int(self.discoverable_timeout_input.text())
+            if timeout > 0:
+                self.discoverable_timeout_timer = QTimer()
+                self.discoverable_timeout_timer.timeout.connect(lambda: self.set_discoverable_mode(False))
+                self.discoverable_timeout_timer.setSingleShot(True)
+                self.discoverable_timeout_timer.start(timeout * 1000)
+            self.log.info("Discoverable mode is set to ON")
+        else:
+            self.set_discoverable_on_button.setEnabled(True)
+            self.set_discoverable_off_button.setEnabled(False)
+            self.bluetooth_device_manager.set_discoverable_mode(False)
+            if hasattr(self, 'discoverable_timeout_timer'):
+                self.discoverable_timeout_timer.stop()
+            self.log.info("Discoverable mode is set to OFF")
+
+    def on_discovery_filter_changed(self, text: str):
+        """Update BlueZ discovery filter based on combo box selection."""
+        if text == "LE Only":
+            transport = "le"
+        elif text == "BR/EDR Only":
+            transport = "bredr"
+        else:
+            transport = "auto"
+        filter_dict = {"Transport": dbus.String(transport)}
+        self.bluetooth_device_manager.set_discovery_filter(filter_dict)
+
+    def start_device_discovery(self):
+        """Start device discovery."""
+        self.inquiry_timeout = int(self.inquiry_timeout_input.text()) * 1000
+        if self.inquiry_timeout == 0:
+            self.set_discovery_on_button.setEnabled(False)
+            self.set_discovery_off_button.setEnabled(True)
+            self.bluetooth_device_manager.start_discovery()
+        else:
+            self.timer = QTimer()
+            self.timer.timeout.connect(self.handle_discovery_timeout)
+            self.timer.timeout.connect(lambda: self.set_discovery_off_button.setEnabled(False))
+            self.timer.start(self.inquiry_timeout)
+            self.set_discovery_on_button.setEnabled(False)
+            self.set_discovery_off_button.setEnabled(True)
+            self.bluetooth_device_manager.start_discovery()
+        self.log.info("Device discovery has started")
+
+    def handle_discovery_timeout(self):
+        """Handles the Bluetooth discovery timeout event"""
+        self.timer.stop()
+        self.bluetooth_device_manager.stop_discovery()
+        self.log.info("Discovery stopped due to timeout.")
+        self.display_discovered_devices()
+
+    def stop_device_discovery(self):
+        """Stops device Discovery"""
+        self.set_discovery_off_button.setEnabled(False)
+        self.timer = QTimer()
+        if self.inquiry_timeout == 0:
+            self.bluetooth_device_manager.stop_discovery()
+            self.display_discovered_devices()
+        else:
+            self.timer.stop()
+            self.bluetooth_device_manager.stop_discovery()
+            self.display_discovered_devices()
+            self.set_discovery_off_button.setEnabled(False)
+        self.log.info("Device discovery has stopped")
+
+    def display_discovered_devices(self):
+        """Display discovered devices in a table with options to pair or connect."""
+        self.timer.stop()
+        bold_font = QFont()
+        bold_font.setBold(True)
+        small_font = QFont()
+        small_font.setBold(True)
+        small_font.setPointSize(8)
+        discovered_devices = self.bluetooth_device_manager.get_discovered_devices()
+        self.clear_device_discovery_results()
+        self.table_widget = QTableWidget(0, 3)
+        self.table_widget.setHorizontalHeaderLabels(["DEVICE NAME", "BD_ADDR", "PROCEDURES"])
+        self.table_widget.setFont(bold_font)
+        header = self.table_widget.horizontalHeader()
+        header.setStyleSheet(styles.horizontal_header_style_sheet)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        vertical_header = self.table_widget.verticalHeader()
+        vertical_header.setStyleSheet(styles.vertical_header_style_sheet)
+        row = 0
+        for device in discovered_devices:
+            device_address = device["address"]
+            device_name = device["alias"]
+            device_path = device["path"]
+            self.table_widget.insertRow(row)
+            self.table_widget.setItem(row, 0, QTableWidgetItem(device_name))
+            self.table_widget.setItem(row, 1, QTableWidgetItem(device_address))
+            button_widget = QWidget()
+            button_layout = QHBoxLayout()
+            button_layout.setContentsMargins(0, 0, 0, 0)
+            button_layout.setSpacing(5)
+            pair_button = QPushButton("PAIR")
+            pair_button.setObjectName("PairButton")
+            pair_button.setFont(small_font)
+            pair_button.setStyleSheet(styles.color_style_sheet)
+            pair_button.clicked.connect(lambda _, addr = device_address: self.perform_device_action('pair', addr, load_profiles=False))
+            button_layout.addWidget(pair_button)
+            connect_button = QPushButton("CONNECT")
+            connect_button.setObjectName("ConnectButton")
+            connect_button.setFont(small_font)
+            connect_button.setStyleSheet(styles.color_style_sheet)
+            connect_button.clicked.connect(lambda _, addr = device_address: self.perform_device_action('connect', addr, load_profiles=True))
+            button_layout.addWidget(connect_button)
+            button_widget.setLayout(button_layout)
+            self.table_widget.setCellWidget(row, 2, button_widget)
+            row += 1
+        self.profile_methods_layout.insertWidget(self.profile_methods_layout.count() - 1, self.table_widget)
+        self.table_widget.show()
+        self.set_discovery_off_button.setEnabled(False)
+
+    def clear_device_discovery_results(self):
+        """Removes the discovery table if it exists to avoid stacking."""
+        if hasattr(self, 'table_widget') and self.table_widget:
+            self.profile_methods_layout.removeWidget(self.table_widget)
+            self.table_widget.deleteLater()
+            self.table_widget = None
+
+    def refresh_discovery_ui(self):
+        """Refresh and clear the device discovery table."""
+        self.log.info("Refresh Button is pressed")
+        if hasattr(self, 'table_widget') and self.table_widget:
+            self.profile_methods_layout.removeWidget(self.table_widget)
+            self.table_widget.deleteLater()
+            self.table_widget = None
+            self.inquiry_timeout_input.setText("0")
+            self.refresh_button.setEnabled(False)
+            self.set_discovery_on_button.setEnabled(True)
+            self.set_discovery_off_button.setEnabled(False)
+            self.refresh_button.setEnabled(True)
+
+    def reset_discoverable_timeout(self):
+        """Reset discoverable timeout input to default (0)."""
+        self.log.info("Discoverable refresh button is pressed")
+        self.discoverable_timeout_input.setText("0")
+
+    def add_paired_device_to_list(self, device_address):
+        """Adds a device address to the paired devices list if not already present.
+
+        Args:
+            device_address: Bluetooth address of remote device.
+        """
+        for i in range(self.profiles_list_widget.count()):
+            if self.profiles_list_widget.item(i).text().strip() == device_address:
+                return
+        device_item = QListWidgetItem(device_address)
+        device_item.setFont(QFont("Courier New", 10))
+        device_item.setForeground(Qt.GlobalColor.black)
+        self.profiles_list_widget.addItem(device_item)
+
+    def clear_layout(self, layout):
+        """Delete all widgets and sub-layouts from a layout.
+
+        Args:
+            layout: The layout to be cleared.
+        """
+        if not isinstance(layout, QLayout):
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if child_layout := item.layout():
+                self.clear_layout(child_layout)
+            elif widget := item.widget():
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def handle_profile_selection(self, profile_name=None):
+        """Handles profile selection from either the list or a button.
+
+        Args:
+            profile_name: The name of the profile to select.
+        """
+        if profile_name is None:
+            selected_item = self.profiles_list_widget.currentItem()
+            if not selected_item:
+                return
+            selected_item_text = selected_item.text().strip()
+        else:
+            selected_item_text = profile_name.strip()
+        self.clear_device_discovery_results()
+        self.clear_profile_ui()
+        if hasattr(self, 'device_tab_widget') and self.device_tab_widget:
+            self.device_tab_widget.currentChanged.disconnect(self.handle_profile_tab_change)
+            self.profile_methods_layout.removeWidget(self.device_tab_widget)
+            self.device_tab_widget.hide()
+            self.device_tab_widget.setParent(None)
+            self.device_tab_widget.deleteLater()
+            self.device_tab_widget = None
+        if validate_bluetooth_address(selected_item_text):
+            self.load_device_profile_tabs(selected_item_text, self.bluetooth_device_manager.device_profiles.get(selected_item_text, []))
+        elif selected_item_text == "GAP":
+            self.create_gap_profile_ui()
+        elif selected_item_text == "GATT":
+            self.open_gatt_dialog()
+
+    def create_gap_profile_ui(self):
+        """Build and display the widgets for the GAP profile."""
+        bold_font = QFont()
+        bold_font.setBold(True)
+        label = QLabel("SetDiscoverable: ")
+        label.setObjectName("SetDiscoverable")
+        label.setFont(bold_font)
+        label.setStyleSheet(styles.color_style_sheet)
+        self.profile_methods_layout.addWidget(label)
+        timeout_layout = QHBoxLayout()
+        timeout_label = QLabel("SetDiscoverable Timeout: ")
+        timeout_label.setObjectName("SetDiscoverableTimeout")
+        timeout_label.setFont(bold_font)
+        timeout_label.setStyleSheet(styles.color_style_sheet)
+        self.discoverable_timeout_input = QLineEdit("0")
+        timeout_layout.addWidget(timeout_label)
+        timeout_layout.addWidget(self.discoverable_timeout_input)
+        self.profile_methods_layout.addLayout(timeout_layout)
+        buttons_layout = QHBoxLayout()
+        self.set_discoverable_on_button = QPushButton("ON")
+        self.set_discoverable_on_button.setObjectName("SetDiscoverableOnButton")
+        self.set_discoverable_on_button.setStyleSheet(styles.color_style_sheet)
+        self.set_discoverable_off_button = QPushButton("OFF")
+        self.set_discoverable_off_button.setObjectName("SetDiscoverableOffButton")
+        self.set_discoverable_off_button.setStyleSheet(styles.color_style_sheet)
+        self.set_discoverable_off_button.setEnabled(False)
+        self.set_discoverable_on_button.clicked.connect(lambda: self.set_discoverable_mode(True))
+        self.set_discoverable_off_button.clicked.connect(lambda: self.set_discoverable_mode(False))
+        buttons_layout.addWidget(self.set_discoverable_on_button)
+        buttons_layout.addWidget(self.set_discoverable_off_button)
+        self.profile_methods_layout.addLayout(buttons_layout)
+        self.refresh_button = QPushButton("REFRESH")
+        self.refresh_button.setObjectName("RefreshButton")
+        self.refresh_button.setStyleSheet(styles.color_style_sheet)
+        self.refresh_button.clicked.connect(self.reset_discoverable_timeout)
+        self.profile_methods_layout.addWidget(self.refresh_button)
+        discovery_type_label = QLabel("Discovery Filter (Transport):")
+        discovery_type_label.setFont(bold_font)
+        discovery_type_label.setStyleSheet(styles.color_style_sheet)
+        self.profile_methods_layout.addWidget(discovery_type_label)
+
+        self.discovery_type_combobox = QComboBox()
+        self.discovery_type_combobox.setFont(QFont("Arial", 10))
+        self.discovery_type_combobox.addItems([
+            "LE Only",
+            "BR/EDR Only",
+            "Both (LE + BR/EDR)"
+        ])
+        self.discovery_type_combobox.setCurrentText("Both (LE + BR/EDR)")
+        self.profile_methods_layout.addWidget(self.discovery_type_combobox)
+        self.discovery_type_combobox.currentTextChanged.connect(self.on_discovery_filter_changed)
+
+        self.start_advertising_button = QPushButton("Start Advertising")
+        self.start_advertising_button.clicked.connect(self.handle_advertising)
+
+        self.start_advertising_button.setFont(bold_font)
+        self.start_advertising_button.setStyleSheet("color: blue")
+        self.start_advertising_button.setEnabled(True)
+        self.profile_methods_layout.addWidget(self.start_advertising_button)
+
+        inquiry_label = QLabel("Inquiry:")
+        inquiry_label.setObjectName("Inquiry")
+        inquiry_label.setFont(bold_font)
+        inquiry_label.setStyleSheet(styles.color_style_sheet)
+        self.profile_methods_layout.addWidget(inquiry_label)
+        inquiry_timeout_layout = QHBoxLayout()
+        inquiry_timeout_label = QLabel("Inquiry Timeout:")
+        inquiry_timeout_label.setObjectName("InquiryTimeoutLabel")
+        inquiry_timeout_label.setFont(bold_font)
+        inquiry_timeout_label.setStyleSheet(styles.color_style_sheet)
+        self.inquiry_timeout_input = QLineEdit("0")
+        inquiry_timeout_layout.addWidget(inquiry_timeout_label)
+        inquiry_timeout_layout.addWidget(self.inquiry_timeout_input)
+        self.profile_methods_layout.addLayout(inquiry_timeout_layout)
+        discovery_buttons_layout = QHBoxLayout()
+        self.set_discovery_on_button = QPushButton("START")
+        self.set_discovery_on_button.setObjectName("SetDiscoveryOnButton")
+        self.set_discovery_on_button.setStyleSheet(styles.color_style_sheet)
+        self.set_discovery_on_button.clicked.connect(self.start_device_discovery)
+        self.set_discovery_off_button = QPushButton("STOP")
+        self.set_discovery_off_button.setObjectName("SetDiscoveryOffButton")
+        self.set_discovery_off_button.setStyleSheet(styles.color_style_sheet)
+        self.set_discovery_off_button.clicked.connect(self.stop_device_discovery)
+        self.set_discovery_off_button.setEnabled(False)
+        discovery_buttons_layout.addWidget(self.set_discovery_on_button)
+        discovery_buttons_layout.addWidget(self.set_discovery_off_button)
+        self.profile_methods_layout.addLayout(discovery_buttons_layout)
+        capability_label = QLabel("Select Capability: ")
+        capability_label.setFont(bold_font)
+        self.capability_combobox = QComboBox()
+        self.capability_combobox.setFont(QFont("Arial", 10))
+        self.capability_combobox.addItems(["DisplayOnly", "DisplayYesNo", "KeyboardOnly", "NoInputNoOutput", "KeyboardDisplay"])
+        self.capability_combobox.setCurrentText("NoInputNoOutput")
+        register_agent_button = QPushButton("Register Agent")
+        register_agent_button.setObjectName("RegisterAgent")
+        register_agent_button.setFont(bold_font)
+        register_agent_button.setStyleSheet(styles.color_style_sheet)
+        register_agent_button.clicked.connect(self.register_bluetooth_agent)
+        self.profile_methods_layout.addWidget(capability_label)
+        self.profile_methods_layout.addWidget(self.capability_combobox)
+        self.profile_methods_layout.addWidget(register_agent_button)
+        discovery_refresh_button = QPushButton("REFRESH")
+        discovery_refresh_button.setObjectName("RefreshButton")
+        discovery_refresh_button.setStyleSheet(styles.color_style_sheet)
+        discovery_refresh_button.clicked.connect(self.refresh_discovery_ui)
+        self.profile_methods_layout.addWidget(discovery_refresh_button)
+        self.profile_methods_layout.addStretch(1)
+
+    def create_a2dp_profile_ui(self, device_address):
+        """Build and display the widgets for the A2DP profile.
+
+        Args:
+             device_address: The Bluetooth address of the device.
+        """
+        bold_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+        a2dp_label = QLabel("<b>A2DP Functionality</b>")
+        a2dp_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        a2dp_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(a2dp_label)
+        self.device_address_source = device_address
+        self.device_address_sink = device_address
+        role = self.bluetooth_device_manager.get_a2dp_role_for_device(device_address)
+        self.log.debug("A2DP role for %s:%s", device_address, role)
+        if role in ["source"]:
+            self.create_a2dp_sink_ui(layout, bold_font)
+        if role in ["sink"]:
+            self.create_a2dp_source_ui(layout, bold_font, device_address)
+        layout.addStretch(1)
+        widget = QWidget()
+        widget.setLayout(layout)
+        return widget
+
+    def create_a2dp_sink_ui(self, layout, bold_font):
+        """create and add the A2DP Sink UI elements to the give layout.
+
+        Args:
+             layout: Parent layout to add the UI.
+             bold_font: Font for bold labels and buttons.
+        """
+        media_control_group = QGroupBox("Media Control (A2DP Sink)")
+        media_control_group.setStyleSheet(styles.bluetooth_profiles_groupbox_style)
+        media_control_layout = QVBoxLayout()
+        media_control_layout.setSpacing(12)
+        media_info_grid = QGridLayout()
+        media_info_grid.setContentsMargins(0, 0, 0, 0)
+        media_info_grid.setSpacing(5)
+        title_label = QLabel("Title:")
+        artist_label = QLabel("Artist:")
+        album_label = QLabel("Album:")
+        for label in [title_label, artist_label, album_label]:
+            label.setFont(bold_font)
+            label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.song_title_label = QLabel("Unknown")
+        self.song_artist_label = QLabel("-")
+        self.song_album_label = QLabel("-")
+        for label in [self.song_title_label, self.song_artist_label, self.song_album_label]:
+            label.setWordWrap(True)
+            label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        media_info_grid.addWidget(title_label, 0, 0)
+        media_info_grid.addWidget(self.song_title_label, 0, 1)
+        media_info_grid.addWidget(artist_label, 1, 0)
+        media_info_grid.addWidget(self.song_artist_label, 1, 1)
+        media_info_grid.addWidget(album_label, 2, 0)
+        media_info_grid.addWidget(self.song_album_label, 2, 1)
+        media_info_grid.setColumnStretch(1, 1)
+        media_control_layout.addLayout(media_info_grid)
+        control_buttons = QHBoxLayout()
+        self.play_button = QPushButton("Play")
+        self.pause_button = QPushButton("Pause")
+        self.next_button = QPushButton("Next")
+        self.previous_button = QPushButton("Previous")
+        self.rewind_button = QPushButton("Rewind")
+        for button, action in [
+            (self.play_button, "play"),
+            (self.pause_button, "pause"),
+            (self.next_button, "next"),
+            (self.previous_button, "previous"),
+            (self.rewind_button, "rewind")
+        ]:
+            button.setStyleSheet(styles.bluetooth_profiles_button_style)
+            button.setFont(bold_font)
+            button.clicked.connect(lambda _, a=action: self.send_media_control_command(a))
+            control_buttons.addWidget(button)
+        media_control_layout.addLayout(control_buttons)
+        self.track_status_label = QLabel("Status: -")
+        self.track_status_label.setFont(bold_font)
+        self.track_status_label.setFont(QFont("Segoe UI", 9))
+        self.track_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        media_control_layout.addWidget(self.track_status_label)
+        self.progress_slider = QSlider(Qt.Orientation.Horizontal)
+        self.progress_slider.setRange(0, 100)
+        self.progress_slider.setEnabled(False)
+        self.progress_slider.setStyleSheet(styles.progress_slider_style_sheet)
+        progress_layout = QVBoxLayout()
+        progress_layout.setSpacing(4)
+        progress_layout.addWidget(self.progress_slider)
+        time_layout = QHBoxLayout()
+        time_layout.setContentsMargins(2, 0, 2, 0)
+        self.elapsed_time_label = QLabel("00:00")
+        self.elapsed_time_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.remaining_time_label = QLabel("00:00")
+        self.remaining_time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        time_layout.addWidget(self.elapsed_time_label)
+        time_layout.addStretch()
+        time_layout.addWidget(self.remaining_time_label)
+        progress_layout.addLayout(time_layout)
+        media_control_layout.addLayout(progress_layout)
+        volume_layout = QHBoxLayout()
+        volume_label = QLabel("Volume:")
+        volume_label.setFont(bold_font)
+        volume_layout.addWidget(volume_label)
+        self.sink_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.sink_volume_slider.setRange(0, 127)
+        self.sink_volume_slider.setFixedWidth(150)
+        self.sink_volume_slider.setStyleSheet(styles.volume_slider_style_sheet)
+        self.sink_volume_slider.setEnabled(True)
+        self.sink_volume_slider.valueChanged.connect(self.set_device_volume)
+        self.volume_value_label = QLabel("100%")
+        self.sink_volume_slider.valueChanged.connect(
+            lambda v: self.volume_value_label.setText(f"{int(v / 127 * 100)}%"))
+        volume_layout.addWidget(self.sink_volume_slider)
+        volume_layout.addWidget(self.volume_value_label)
+        media_control_layout.addLayout(volume_layout)
+        media_control_group.setLayout(media_control_layout)
+        layout.addWidget(media_control_group)
+        self.volume_control()
+        self.start_media_playback_timer()
+
+    def create_a2dp_source_ui(self, layout, bold_font, device_address):
+        """create and add the A2DP Source UI elements to the give layout.
+
+        Args:
+            layout: Parent layout to add the UI.
+            bold_font: Font for bold labels and buttons.
+        """
+        streaming_group = QGroupBox("Streaming Audio (A2DP Source)")
+        streaming_group.setStyleSheet(styles.bluetooth_profiles_groupbox_style)
+        streaming_layout = QVBoxLayout()
+        streaming_layout.setSpacing(10)
+        streaming_layout.setContentsMargins(10, 10, 10, 10)
+        self.source_status_label = QLabel("Status: Not Streaming")
+        self.source_status_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        streaming_layout.addWidget(self.source_status_label)
+        audio_playlistatus_panel_layout = QVBoxLayout()
+        playlist_label = QLabel("Audio Playlist:")
+        playlist_label.setFont(bold_font)
+        audio_playlistatus_panel_layout.addWidget(playlist_label)
+        self.audio_playlist = QListWidget()
+        self.audio_playlist.setFixedHeight(100)
+        self.audio_playlist.setFixedHeight(100)
+        audio_playlistatus_panel_layout.addWidget(self.audio_playlist)
+        if device_address in self.audio_playlist_data:
+            for file in self.audio_playlist_data[device_address]:
+                self.audio_playlist.addItem(file)
+        playlist_buttons = QHBoxLayout()
+        self.add_files_button = QPushButton("Add Files")
+        self.add_files_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.add_files_button.clicked.connect(self.select_audio_file)
+        self.remove_selected_button = QPushButton("Remove Selected")
+        self.remove_selected_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.remove_selected_button.clicked.connect(self.remove_selected_file)
+        self.clear_playlist_button = QPushButton("Clear")
+        self.clear_playlist_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.clear_playlist_button.clicked.connect(self.clear_playlist)
+        playlist_buttons.addWidget(self.add_files_button)
+        playlist_buttons.addWidget(self.remove_selected_button)
+        playlist_buttons.addWidget(self.clear_playlist_button)
+        audio_playlistatus_panel_layout.addLayout(playlist_buttons)
+        streaming_layout.addLayout(audio_playlistatus_panel_layout)
+        volume_layout = QHBoxLayout()
+        volume_label = QLabel("Volume:")
+        volume_label.setFont(bold_font)
+        volume_layout.addWidget(volume_label)
+        self.source_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.source_volume_slider.setRange(0, 100)
+        self.source_volume_slider.setValue(100)
+        self.source_volume_slider.setFixedWidth(150)
+        self.source_volume_slider.setStyleSheet(styles.volume_slider_style_sheet)
+        self.source_volume_slider.valueChanged.connect(self.set_source_volume)
+        self.source_volume_label = QLabel("100%")
+        self.source_volume_slider.valueChanged.connect(lambda v: self.source_volume_label.setText(f"{v}%"))
+        volume_layout.addWidget(self.source_volume_slider)
+        volume_layout.addWidget(self.source_volume_label)
+        streaming_layout.addLayout(volume_layout)
+        streaming_buttons_layout = QHBoxLayout()
+        self.start_streaming_button = QPushButton("Start Streaming")
+        self.start_streaming_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.start_streaming_button.clicked.connect(self.start_a2dp_streaming)
+        self.stop_streaming_button = QPushButton("Stop Streaming")
+        self.stop_streaming_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.stop_streaming_button.clicked.connect(self.stop_a2dp_streaming)
+        is_streaming = self.device_streaming_status.get(device_address, False)
+        self.update_streaming_buttons(is_streaming)
+        self.source_status_label.setText("Status: Streaming" if is_streaming else "Status: Not Streaming")
+        streaming_buttons_layout.addWidget(self.start_streaming_button)
+        streaming_buttons_layout.addWidget(self.stop_streaming_button)
+        streaming_layout.addLayout(streaming_buttons_layout)
+        streaming_group.setLayout(streaming_layout)
+        layout.addWidget(streaming_group)
+
+    def create_opp_profile_ui(self, device_address):
+        """Builds and returns the OPP (Object Push Profile) panel for Bluetooth file transfer.
+
+        Args:
+            device_address: The Bluetooth address of the device.
+        """
+        bold_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+        opp_label = QLabel("<b>OPP Functionality</b>")
+        opp_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        opp_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(opp_label)
+        session_path = self.bluetooth_device_manager.device_states.get(device_address, {}).get("session_path")
+        if not session_path:
+            warning_label = QLabel("Device is not connected. Connect to enable OPP profile.")
+            warning_label.setObjectName("WarningLabel")
+            warning_label.setFont(bold_font)
+            warning_label.setStyleSheet(styles.color_style_sheet)
+            layout.addWidget(warning_label)
+            layout.addStretch(1)
+            widget = QWidget()
+            widget.setLayout(layout)
+            widget.setStyleSheet(styles.widget_style_sheet)
+            return widget
+        opp_group = QGroupBox("File Transfer")
+        opp_group.setStyleSheet(styles.bluetooth_profiles_groupbox_style)
+        opp_layout = QVBoxLayout()
+        opp_layout.setSpacing(10)
+        opp_layout.setContentsMargins(10, 10, 10, 10)
+        file_selection_layout = QHBoxLayout()
+        file_label = QLabel("Select File:")
+        file_label.setFont(bold_font)
+        file_selection_layout.addWidget(file_label)
+        self.opp_location_input = QLineEdit()
+        self.opp_location_input.setReadOnly(True)
+        self.opp_location_input.setFixedHeight(28)
+        file_selection_layout.addWidget(self.opp_location_input)
+        self.browse_opp_button = QPushButton("Browse")
+        self.browse_opp_button.setFont(bold_font)
+        self.browse_opp_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.browse_opp_button.clicked.connect(self.select_opp_file)
+        file_selection_layout.addWidget(self.browse_opp_button)
+        opp_layout.addLayout(file_selection_layout)
+        button_layout = QHBoxLayout()
+        self.send_file_button = QPushButton("Send File")
+        self.send_file_button.setFont(bold_font)
+        self.send_file_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.send_file_button.clicked.connect(self.send_file)
+        button_layout.addWidget(self.send_file_button)
+        self.receive_file_button = QPushButton("Receive File")
+        self.receive_file_button.setFont(bold_font)
+        self.receive_file_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.receive_file_button.clicked.connect(self.receive_file)
+        button_layout.addWidget(self.receive_file_button)
+        opp_layout.addLayout(button_layout)
+        opp_group.setLayout(opp_layout)
+        layout.addWidget(opp_group)
+        layout.addStretch(1)
+        widget = QWidget()
+        widget.setLayout(layout)
+        return widget
+
+    def create_pbap_profile_ui(self, device_address):
+        """Builds and returns the PBAP (Phone Book Access Profile) panel for Bluetooth contacts access.
+
+        Args:
+            device_address: The Bluetooth address of the device.
+        """
+        bold_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(15)
+        pbap_label = QLabel("<b>PBAP Functionality</b>")
+        pbap_label.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        pbap_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(pbap_label)
+        session_path = self.bluetooth_device_manager.device_states.get(device_address, {}).get("pbap_session")
+        if not session_path:
+            warning_label = QLabel("Device is not connected. Connect to enable PBAP profile.")
+            warning_label.setObjectName("WarningLabel")
+            warning_label.setFont(bold_font)
+            warning_label.setStyleSheet(styles.color_style_sheet)
+            layout.addWidget(warning_label)
+            layout.addStretch(1)
+            widget = QWidget()
+            widget.setLayout(layout)
+            widget.setStyleSheet(styles.widget_style_sheet)
+            return widget
+        pbap_group = QGroupBox("Phonebook Access")
+        pbap_group.setStyleSheet(styles.bluetooth_profiles_groupbox_style)
+        pbap_layout = QVBoxLayout()
+        pbap_layout.setSpacing(10)
+        pbap_layout.setContentsMargins(10, 10, 10, 10)
+        single_layout = QHBoxLayout()
+        single_label = QLabel("Pull Contact:")
+        single_label.setFont(bold_font)
+        single_layout.addWidget(single_label)
+        self.pbap_single_input = QLineEdit()
+        self.pbap_single_input.setPlaceholderText("e.g., 1.vcf")
+        single_layout.addWidget(self.pbap_single_input)
+        self.pbap_single_path_input = QLineEdit()
+        self.pbap_single_path_input.setReadOnly(True)
+        self.pbap_single_path_input.setPlaceholderText("Select save location...")
+        single_layout.addWidget(self.pbap_single_path_input)
+        self.browse_single_button = QPushButton("Browse")
+        self.browse_single_button.setFont(bold_font)
+        self.browse_single_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.browse_single_button.clicked.connect(lambda: self.select_pbap_save_location("single"))
+        single_layout.addWidget(self.browse_single_button)
+        self.pull_single_button = QPushButton("Pull")
+        self.pull_single_button.setFont(bold_font)
+        self.pull_single_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.pull_single_button.clicked.connect(self.pull_single_contact)
+        single_layout.addWidget(self.pull_single_button)
+        pbap_layout.addLayout(single_layout)
+        pull_all_layout = QHBoxLayout()
+        pull_all_label = QLabel("Pull All Contacts:")
+        pull_all_label.setFont(bold_font)
+        pull_all_layout.addWidget(pull_all_label)
+        self.pbap_all_path_input = QLineEdit()
+        self.pbap_all_path_input.setReadOnly(True)
+        pull_all_layout.addWidget(self.pbap_all_path_input)
+        self.browse_all_button = QPushButton("Browse")
+        self.browse_all_button.setFont(bold_font)
+        self.browse_all_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.browse_all_button.clicked.connect(lambda: self.select_pbap_save_location("all"))
+        pull_all_layout.addWidget(self.browse_all_button)
+        self.pull_all_button = QPushButton("Pull All")
+        self.pull_all_button.setFont(bold_font)
+        self.pull_all_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.pull_all_button.clicked.connect(self.pull_all_contacts)
+        pull_all_layout.addWidget(self.pull_all_button)
+        pbap_layout.addLayout(pull_all_layout)
+        pbap_group.setLayout(pbap_layout)
+        layout.addWidget(pbap_group)
+        layout.addStretch(1)
+        widget = QWidget()
+        widget.setLayout(layout)
+        widget.setStyleSheet(styles.widget_style_sheet)
+        return widget
+
+
+    def pull_single_contact(self):
+        """UI handler to pull a single contact via PBAP."""
+        contact_name = self.pbap_single_input.text()
+        session_path = self.bluetooth_device_manager.device_states.get(self.device_address, {}).get("pbap_session")
+        if not contact_name or not self.device_address:
+            QMessageBox.warning(None, "PBAP", "Please select a device and a contact name.")
+            return
+        self.pull_single_button.setEnabled(False)
+        self.pull_single_button.setText("Pulling...")
+        try:
+            status = self.bluetooth_device_manager.pull_single_contact(
+                self.device_address, contact_name, session_path, save_path=self.pbap_single_path_input.text()
+            )
+        except Exception as error:
+            status = "error"
+            self.log.info("UI error: %s", error)
+        self.pull_single_button.setEnabled(True)
+        self.pull_single_button.setText("Pull")
+        if status == "complete":
+            QMessageBox.information(None, "PBAP", "Contact pulled successfully!")
+        else:
+            QMessageBox.warning(None, "PBAP", "Contact pull failed.")
+
+    def pull_all_contacts(self):
+        """UI handler to pull all contacts via PBAP."""
+        save_path = self.pbap_all_path_input.text()
+        session_path = self.bluetooth_device_manager.device_states.get(self.device_address, {}).get("pbap_session")
+        if not save_path or not self.device_address:
+            QMessageBox.warning(None, "PBAP", "Please select a device and a save location.")
+            return
+        self.pull_all_button.setEnabled(False)
+        self.pull_all_button.setText("Pulling all...")
+        try:
+            status = self.bluetooth_device_manager.pull_all_contacts(
+                self.device_address, save_path, session_path
+            )
+        except Exception as error:
+            status = "error"
+            self.log.info("UI error: %s", error)
+        self.pull_all_button.setEnabled(True)
+        self.pull_all_button.setText("Pull All")
+        if status == "complete":
+            QMessageBox.information(None, "PBAP", "All contacts pulled successfully!")
+        else:
+            QMessageBox.warning(None, "PBAP", "Failed to pull contacts.")
+
+    def select_pbap_save_location(self, mode):
+        """Opens a file dialog to select save location for PBAP contacts.
+
+        Args:
+            mode: "single" for a single contact, "all" for all contacts.
+        """
+        options = QFileDialog.Option.DontUseNativeDialog
+        if mode == "single":
+            title = "Select Save Location for Single Contact"
+            default_path = "/root/Documents/tmp/phone.vcf"
+            line_edit = self.pbap_single_path_input
+        elif mode == "all":
+            title = "Select Save Location for All Contacts"
+            default_path = "/root/Documents/tmp/Contacts.vcf"
+            line_edit = self.pbap_all_path_input
+        else:
+            return
+        file_path, _ = QFileDialog.getSaveFileName(
+            None,
+            title,
+            default_path,
+            "vCard Files (*.vcf);;All Files (*)",
+            options=options
+        )
+        if file_path:
+            line_edit.setText(file_path)
+
+    def send_media_control_command(self, command):
+        """Sends a media control command to the connected Bluetooth device.
+
+        Args:
+            command: The media control command to send (e.g., "play", "pause", "next", "previous").
+        """
+        self.bluetooth_device_manager.media_control(command, address=self.device_address_sink)
+        self.log.info("Media command %s sent to device %s.", command, self.device_address_sink)
+
+    def start_a2dp_streaming(self):
+        """Start A2DP streaming to a selected Bluetooth sink device."""
+        selected_items = self.audio_playlist.selectedItems()
+
+        if not selected_items:
+            QMessageBox.warning(self, "No File Selected", "Please select an audio file from the playlist.")
+            return
+        audio_path = selected_items[0].text().strip()
+        if not os.path.exists(audio_path):
+            QMessageBox.warning(self, "Invalid Audio File", "Selected file does not exist.")
+            return
+        if not self.device_address_source:
+            QMessageBox.warning(self, "No Device", "Please select a Bluetooth sink device to stream.")
+            return
+        self.log.info("A2DP streaming started with file: %s", audio_path)
+        self.start_streaming_button.setEnabled(False)
+        self.stop_streaming_button.setEnabled(True)
+        self.source_status_label.setText("Status: Streaming")
+        success = self.bluetooth_device_manager.start_a2dp_stream(self.device_address_source, audio_path)
+        if success:
+            self.device_streaming_status[self.device_address_source] = True
+            self.start_streaming_button.setEnabled(False)
+            self.stop_streaming_button.setEnabled(True)
+            self.source_status_label.setText("Status: Streaming")
+
+            self.monitor_stream_timer = QTimer(self)
+            self.monitor_stream_timer.setInterval(1000)
+            self.monitor_stream_timer.timeout.connect(self.check_streaming_status)
+            self.monitor_stream_timer.start()
+        else:
+            QMessageBox.critical(self, "Streaming Failed", "Failed to start streaming.")
+            self.device_streaming_status[self.device_address_source] = False
+            self.start_streaming_button.setEnabled(True)
+            self.stop_streaming_button.setEnabled(False)
+            self.source_status_label.setText("Status: Failed")
+
+    def stop_a2dp_streaming(self):
+        """Stop the active A2DP streaming session and update the UI accordingly."""
+        self.log.info("A2DP streaming stopped")
+        self.device_streaming_status[self.device_address_source] = False
+        self.start_streaming_button.setEnabled(True)
+        self.stop_streaming_button.setEnabled(False)
+        self.source_status_label.setText("Status: Stopped")
+        self.bluetooth_device_manager.stop_a2dp_stream()
+        if hasattr(self, 'streaming_timer'):
+            self.streaming_timer.stop()
+
+    def update_streaming_buttons(self, streaming: bool):
+        """Enable or disable the Start/Stop A2DP streaming buttons depending on the current streaming state.
+
+        Args:
+            streaming: True if streaming is active, False otherwise.
+        """
+        self.start_streaming_button.setEnabled(not streaming)
+        self.stop_streaming_button.setEnabled(streaming)
+
+    def check_streaming_status(self):
+        """Periodically monitor the A2DP streaming process to detect if playback has unexpectedly stopped."""
+        if not hasattr(self, "monitor_stream_timer") or self.monitor_stream_timer is None:
+            return
+
+        process = self.bluetooth_device_manager.stream_process
+
+        if process and process.poll() is not None:
+            self.monitor_stream_timer.timeout.disconnect(self.check_streaming_status)
+            self.monitor_stream_timer.stop()
+            self.monitor_stream_timer.deleteLater()
+            self.monitor_stream_timer = None
+            self.device_streaming_status[self.device_address_source] = False
+            self.start_streaming_button.setEnabled(True)
+            self.stop_streaming_button.setEnabled(False)
+            self.source_status_label.setText("Status: Not Streaming")
+
+    def select_audio_file(self):
+        """Browse and add multiple audio files to playlist."""
+        files, _ = QFileDialog.getOpenFileNames(self, "Select Audio Files", "", "Audio Files (*.mp3 *.wav *.ogg)")
+        invalid_files = []
+
+        if files:
+            device = self.device_address_sink
+            if device not in self.audio_playlist_data:
+                self.audio_playlist_data[device] = []
+
+            for file_path in files:
+                if os.path.exists(file_path):
+                    self.audio_playlist_data[device].append(file_path)
+                    self.audio_playlist.addItem(file_path)
+                else:
+                    invalid_files.append(file_path)
+
+        if invalid_files:
+            warning_msg = "The following files were not found and were not added:\n" + "\n".join(invalid_files)
+            QMessageBox.warning(self, "File Not Found", warning_msg)
+
+    def select_opp_file(self):
+        """Open a file dialog to select a file to send via OPP."""
+        file_dialog = QFileDialog()
+        file_path, _ = file_dialog.getOpenFileName(None, "Select File to Send via OPP", "", "All Files (*)")
+        if file_path:
+            if not os.path.exists(file_path):
+                QMessageBox.critical(None, "Invalid File", "The selected file does not exist.")
+                self.log.error("Selected OPP file does not exist: %s", file_path)
+                return
+            self.opp_location_input.setText(file_path)
+            self.log.info("File selected to send via OPP")
+
+    def send_file(self):
+        """Send a selected file to a remote device using OPP."""
+        file_path = self.opp_location_input.text()
+        session_path = self.bluetooth_device_manager.device_states.get(self.device_address, {}).get("session_path")
+        if not file_path or not self.device_address:
+            QMessageBox.warning(None, "OPP", "Please select a device and a file.")
+            return
+        self.send_file_button.setEnabled(False)
+        self.send_file_button.setText("Sending...")
+        try:
+            status = self.bluetooth_device_manager.send_file(self.device_address, file_path, session_path)
+        except Exception as error:
+            status = "error"
+            self.log.info("UI error:%s", error)
+        self.send_file_button.setEnabled(True)
+        self.send_file_button.setText("Send File")
+        if status == "complete":
+            QMessageBox.information(None, "OPP", "File sent successfully!")
+        elif status == "queued":
+            QMessageBox.information(None, "OPP", "File transfer is queued. Please wait...")
+        elif status == "unknown":
+            QMessageBox.warning(None, "OPP", "File transfer status is unknown.")
+        else:
+            QMessageBox.warning(None, "OPP", "File transfer failed or was rejected.")
+
+    def receive_file(self):
+        """Start OPP receiver and handle file transfer."""
+        try:
+            received_file_path = self.bluetooth_device_manager.receive_file(
+                user_confirm_callback=self.user_confirm_file_transfer)
+            if received_file_path:
+                QMessageBox.information(None, "File Received", f"File received successfully:\n{received_file_path}")
+            else:
+                QMessageBox.warning(None, "File Transfer", "No file received or user declined the transfer.")
+        except Exception as error:
+            QMessageBox.critical(None, "Error", f"An error occurred during file reception:\n{str(error)}")
+
+    def handle_profile_tab_change(self, index):
+        """Handles actions when switching between profile tabs (e.g., A2DP, OPP), and refreshes the selected tab's UI.
+
+        Args:
+            index: The index of the newly selected tab in the device tab widget.
+        """
+        if hasattr(self, "playback_timer") and self.playback_timer is not None:
+            if self.playback_timer.isActive():
+                self.playback_timer.stop()
+            self.playback_timer.deleteLater()
+            self.playback_timer = None
+
+        if not hasattr(self, 'device_tab_widget') or index < 0:
+            return
+
+        selected_tab = self.device_tab_widget.tabText(index)
+        current_device = getattr(self, "device_address", None)
+
+        if not current_device:
+            self.log.warning("No active device set for tab switch")
+            return
+
+        self.log.info("Switched to %s tab for %s", selected_tab, current_device)
+
+        if selected_tab == "A2DP":
+            a2dp_panel = self.create_a2dp_profile_ui(current_device)
+            self.refresh_tab(self.a2dp_tab_placeholder, a2dp_panel)
+            self.log.info("Refreshed A2DP tab for %s", current_device)
+
+        elif selected_tab == "OPP":
+            opp_panel = self.create_opp_profile_ui(current_device)
+            self.refresh_tab(self.opp_tab_placeholder, opp_panel)
+            self.log.info("Refreshed OPP tab for %s", current_device)
+
+        elif selected_tab == "PBAP":
+            pbap_panel = self.create_pbap_profile_ui(current_device)
+            self.refresh_tab(self.pbap_tab_placeholder, pbap_panel)
+            self.log.info("Refreshed PBAP tab for %s", current_device)
+
+        elif selected_tab == "HFP":
+            hfp_panel = self.create_hfp_profile_ui(current_device)
+            self.refresh_tab(self.hfp_tab_placeholder, hfp_panel)
+            self.log.info("Refreshed HFP tab for %s", current_device)
+
+    def load_device_profile_tabs(self, device_address, profile_list):
+        """Loads and displays profile-related UI tabs for a specific Bluetooth device.
+
+        Args:
+            device_address: The Bluetooth address of the device.
+            profile_list: A list of supported profile names.
+                          The keyword 'all' will include all supported profiles.
+        """
+        self.clear_profile_ui()
+        bold_font = QFont()
+        bold_font.setBold(True)
+        self.device_address = device_address
+        is_connected = self.bluetooth_device_manager.is_device_connected(device_address)
+        session_path = self.bluetooth_device_manager.device_states.get(device_address, {}).get("session_path")
+        if not is_connected and not session_path:
+            warning_label = QLabel("Device is not connected. Connect to enable profile controls.")
+            warning_label.setObjectName("WarningLabel")
+            warning_label.setFont(bold_font)
+            warning_label.setStyleSheet(styles.color_style_sheet)
+            self.clear_layout(self.profile_methods_layout)
+            self.profile_methods_layout.addWidget(warning_label)
+            self.add_device_connection_controls(self.profile_methods_layout, device_address)
+            return
+        self.device_tab_widget = QTabWidget()
+        self.device_tab_widget.setMaximumWidth(600)
+        self.device_tab_widget.setFont(bold_font)
+        self.device_tab_widget.setStyleSheet(styles.device_tab_widget_style_sheet)
+        self.a2dp_tab_placeholder = QWidget()
+        self.opp_tab_placeholder = QWidget()
+        self.pbap_tab_placeholder = QWidget()
+        self.hfp_tab_placeholder = QWidget()
+        added_profile_tabs = []
+        profile_list = [p.lower() for p in profile_list]
+        if 'a2dp' in profile_list or 'all' in profile_list:
+            index = self.device_tab_widget.count()
+            self.device_tab_widget.addTab(self.a2dp_tab_placeholder, "A2DP")
+            added_profile_tabs.append(index)
+        if 'opp' in profile_list or 'all' in profile_list:
+            index = self.device_tab_widget.count()
+            self.device_tab_widget.addTab(self.opp_tab_placeholder, "OPP")
+            added_profile_tabs.append(index)
+        if 'pbap' in profile_list or 'all' in profile_list:
+            index = self.device_tab_widget.count()
+            self.device_tab_widget.addTab(self.pbap_tab_placeholder, "PBAP")
+            added_profile_tabs.append(index)
+        if 'hfp' in profile_list or 'all' in profile_list:
+            index = self.device_tab_widget.count()
+            self.device_tab_widget.addTab(self.hfp_tab_placeholder, "HFP")
+            added_profile_tabs.append(index)
+        self.device_tab_widget.currentChanged.connect(self.handle_profile_tab_change)
+        self.clear_layout(self.profile_methods_layout)
+        self.profile_methods_layout.addWidget(self.device_tab_widget)
+        if added_profile_tabs:
+            self.device_tab_widget.setCurrentIndex(added_profile_tabs[0])
+            self.handle_profile_tab_change(added_profile_tabs[0])
+        self.add_device_connection_controls(self.profile_methods_layout, device_address)
+
+    def add_device_connection_controls(self, layout, device_address):
+        """Adds Connect, Disconnect, and Unpair buttons to the provided layout for the specified device.
+
+        Args:
+            layout: The layout to which the control buttons will be added.
+            device_address: The Bluetooth address of the device the controls apply to.
+        """
+        bold_font = QFont()
+        bold_font.setBold(True)
+        button_layout = QHBoxLayout()
+        self.is_connected = self.bluetooth_device_manager.is_device_connected(device_address)
+        opp_connected = "OPP" in self.device_profiles.get(device_address, [])
+        has_session = self.bluetooth_device_manager.device_states.get(device_address, {}).get("session_path") is not None
+        self.is_paired = device_address in self.bluetooth_device_manager.get_paired_devices()
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.setFont(bold_font)
+        self.connect_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.connect_button.setFixedWidth(100)
+        self.connect_button.setEnabled(not self.is_connected and not (opp_connected and has_session))
+        self.connect_button.clicked.connect(
+            #lambda: self.perform_device_action('connect', device_address, load_profiles=True))
+            lambda: self.handle_connect_clicked(device_address))
+        button_layout.addWidget(self.connect_button)
+        self.disconnect_button = QPushButton("Disconnect")
+        self.disconnect_button.setFont(bold_font)
+        self.disconnect_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.disconnect_button.setFixedWidth(100)
+        self.disconnect_button.setEnabled(self.is_connected or (opp_connected and has_session))
+        self.disconnect_button.clicked.connect(
+            #lambda: self.perform_device_action('disconnect', device_address, load_profiles=True))
+            lambda: self.handle_disconnect_clicked(device_address))
+        button_layout.addWidget(self.disconnect_button)
+        self.unpair_button = QPushButton("Unpair")
+        self.unpair_button.setFont(bold_font)
+        self.unpair_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        self.unpair_button.setFixedWidth(100)
+        self.unpair_button.setEnabled(True)
+        self.unpair_button.clicked.connect(
+            lambda: self.perform_device_action('unpair', device_address, load_profiles=True))
+        button_layout.addWidget(self.unpair_button)
+        layout.addLayout(button_layout)
+
+    def perform_device_action(self, action, device_address, load_profiles):
+        """Perform a Bluetooth device action (connect, disconnect, pair, unpair) and handle the response.
+
+        Args:
+            action: The action to perform. Expected values: "connect", "disconnect", "pair", "unpair".
+            device_address: The bluetooth address of the remote device.
+            load_profiles: Indicates whether to load device profiles after a successful connect.
+        """
+        device_action = constants.device_action_map.get(action)
+        if not device_action:
+            self.log.error("Unknown action: %s", action)
+            return
+        method_name, response_handler = device_action
+        method = getattr(self.bluetooth_device_manager, method_name)
+        selected_profiles = {}
+        result = method(device_address)
+        self.log.info("Performing %s on %s", method_name, device_address)
+        if result:
+            self.log.info(f"{device_address}: Device {action} successful.")
+        else:
+            self.log.info(f"{device_address}: Device {action} failed.")
+        response_handler = getattr(self, response_handler)
+        if action == "connect" and load_profiles:
+            profile_list = self.bluetooth_device_manager.device_profiles.get(device_address, [])
+            response_handler(device_address, profile_list)
+        elif action == "disconnect":
+            profile_list = self.bluetooth_device_manager.device_profiles.get(device_address, [])
+            response_handler(device_address, profile_list)
+        elif action == "unpair":
+            response_handler(device_address)
+        elif action == "pair" and self.bluetooth_device_manager.is_device_paired(device_address):
+            response_handler(device_address)
+
+    def get_profile_selection_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Bluetooth Profiles to Connect")
+        dialog.setMinimumSize(400, 400)
+        dialog.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(5)
+        all_profiles = QCheckBox("All Profiles")
+        a2dp_checkbox = QCheckBox("A2DP (Audio Streaming)")
+        opp_checkbox = QCheckBox("OPP (File Transfer)")
+        pbap_checkbox = QCheckBox("PBAP (Phonebook Access)")
+        hfp_checkbox = QCheckBox("HFP (Telephony)")
+        layout.addWidget(all_profiles)
+        layout.addWidget(a2dp_checkbox)
+        layout.addWidget(opp_checkbox)
+        layout.addWidget(pbap_checkbox)
+        layout.addWidget(hfp_checkbox)
+        a2dp_role_group = QGroupBox("Select A2DP Role")
+        role_layout = QHBoxLayout()
+        sink_radio = QRadioButton("Sink")
+        source_radio = QRadioButton("Source")
+        sink_radio.setChecked(True)
+        role_layout.addWidget(sink_radio)
+        role_layout.addWidget(source_radio)
+        a2dp_role_group.setLayout(role_layout)
+        a2dp_role_group.setVisible(False)
+        layout.addWidget(a2dp_role_group)
+        a2dp_checkbox.stateChanged.connect(lambda: a2dp_role_group.setVisible(a2dp_checkbox.isChecked()))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        return dialog, all_profiles, a2dp_checkbox, opp_checkbox, pbap_checkbox,hfp_checkbox, sink_radio
+
+    def handle_connect_clicked(self, device_address):
+        dialog, all_profiles, a2dp_checkbox, opp_checkbox, pbap_checkbox, hfp_checkbox, sink_radio = self.get_profile_selection_dialog()
+        if not dialog.exec():
+            return
+
+        self.selected_profiles.clear()
+        for profile, widget_name in constants.profile_widget_map.items():
+            widget = locals().get(widget_name)
+            if widget and widget.isChecked():
+                if profile == 'a2dp':
+                    self.selected_profiles[profile] = 'sink' if sink_radio.isChecked() else 'source'
+                else:
+                    self.selected_profiles[profile] = True
+
+        if not self.selected_profiles:
+            QMessageBox.warning(self, "No Profile Selected", "Please select at least one profile to connect.")
+            return
+        success, message = self.bluetooth_device_manager.handle_connect(
+            device_address, self.selected_profiles, load_profiles=True
+        )
+        profiles = self.bluetooth_device_manager.device_profiles.get(device_address, [])
+        if profiles:
+            self.clear_device_discovery_results()
+            self.clear_profile_ui()
+            self.load_device_profile_tabs(device_address, profiles)
+
+        if success:
+            QMessageBox.information(self, "Connection Successful", message)
+        else:
+            QMessageBox.warning(self, "Connection Result", message)
+
+    def handle_disconnect_clicked(self, device_address):
+        success = self.bluetooth_device_manager.handle_disconnect(device_address)
+        self.clear_profile_ui()
+        self.load_device_profile_tabs(device_address, [])
+        if success:
+            QMessageBox.information(self, "Disconnection Successful", f"{device_address} was disconnected.")
+        else:
+            QMessageBox.warning(self, "Disconnection Failed", f"Could not disconnect {device_address}.")
+
+    def remove_device_from_list(self, unpaired_device_address):
+        """Removes a specific unpaired device from the profiles list (if present).
+
+        Args:
+            unpaired_device_address: Bluetooth address of device to remove.
+        """
+        for i in range(self.profiles_list_widget.count()):
+            item_text = self.profiles_list_widget.item(i).text().strip()
+            if item_text == unpaired_device_address:
+                self.profiles_list_widget.takeItem(i)
+                break
+
+    def register_bluetooth_agent(self):
+        """Register bluetooth pairing agent"""
+        selected_capability = self.capability_combobox.currentText()
+        self.log.info("Attempting to register agent with capability:%s", selected_capability)
+        try:
+            self.bluetooth_device_manager.register_agent(capability=selected_capability)
+            QMessageBox.information(self, "Agent Registered", f"Agent registered with capability: {selected_capability}")
+        except Exception as error:
+            self.log.info("Failed to register agent:%s", error)
+            QMessageBox.critical(self, "Registration Failed", f"Could not register agent.\n{error}")
+
+    def initialize_host_ui(self):
+        """Create and display the main testing application GUI."""
+        self.main_grid_layout = QGridLayout()
+        bold_font = QFont()
+        bold_font.setBold(True)
+        # Grid 1: GAP button,Paired_devices, Controller details
+        self.gap_button = QPushButton("GAP")
+        self.gap_button.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.gap_button.setStyleSheet(styles.gap_button_style_sheet)
+        self.gap_button.setFixedWidth(170)
+        self.gap_button.setMinimumHeight(30)
+        self.gap_button.clicked.connect(lambda: self. handle_profile_selection("GAP "))
+        self.main_grid_layout.addWidget(self.gap_button, 0, 0, 1, 1)
+        self.gatt_button = QPushButton("GATT")
+        self.gatt_button.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.gatt_button.setStyleSheet(styles.gap_button_style_sheet)
+        self.gatt_button.setFixedWidth(170)
+        self.gatt_button.setMinimumHeight(30)
+        self.gatt_button.clicked.connect(self.open_gatt_dialog)
+        self.main_grid_layout.addWidget(self.gatt_button, 0, 1, 1, 1)
+        self.profiles_list_widget = QListWidget()
+        self.profiles_list_widget.setFont(bold_font)
+        self.profiles_list_widget.setContentsMargins(4, 4, 4, 4)
+        self.profiles_list_widget.setStyleSheet(styles.profiles_list_style_sheet)
+        self.profiles_list_widget.setFixedWidth(350)
+        self.profiles_list_widget.itemClicked.connect(lambda: self.handle_profile_selection())
+        paired_devices_label = QLabel("Paired Devices")
+        paired_devices_label.setObjectName("PairedDevicesList")
+        paired_devices_label.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        paired_devices_label.setStyleSheet(styles.color_style_sheet)
+        paired_devices_layout = QVBoxLayout()
+        paired_devices_layout.setContentsMargins(8, 8, 8, 8)
+        paired_devices_layout.setSpacing(6)
+        paired_devices_layout.addWidget(paired_devices_label)
+        paired_devices_layout.addWidget(self.profiles_list_widget)
+        paired_devices_widget = QWidget()
+        paired_devices_widget.setLayout(paired_devices_layout)
+        paired_devices_widget.setFixedWidth(350)
+        paired_devices_widget.setStyleSheet(styles.panel_style_sheet)
+        self.main_grid_layout.addWidget(paired_devices_widget, 1, 0, 4, 2)
+        controller_details_widget = QWidget()
+        controller_layout = QVBoxLayout(controller_details_widget)
+        controller_details_widget.setFixedWidth(350)
+        controller_details_widget.setStyleSheet(styles.panel_style_sheet)
+        controller_label = QLabel("Controller Details")
+        controller_label.setObjectName("ControllerDetails")
+        controller_label.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        controller_label.setStyleSheet(styles.color_style_sheet)
+        controller_layout.addWidget(controller_label)
+        details = get_controller_interface_details(self.log, interface=self.interface, detail_level='extended_info')
+        self.grid = QGridLayout()
+        self.grid.setHorizontalSpacing(10)
+        self.grid.setVerticalSpacing(12)
+        self.grid.setColumnStretch(0, 1)
+        self.grid.setColumnStretch(1, 2)
+        self.add_controller_details_row(0, "Controller Name", details.get("Name", "N/A"))
+        self.add_controller_details_row(1, "Controller Address", details.get("BD_ADDR", "N/A"))
+        self.add_controller_details_row(2, "Link Mode", details.get("Link mode", "N/A"))
+        self.add_controller_details_row(3, "Link Policy", details.get("Link policy", "N/A"))
+        self.add_controller_details_row(4, "HCI Version", details.get("HCI Version", "N/A"))
+        self.add_controller_details_row(5, "LMP Version", details.get("LMP Version", "N/A"))
+        self.add_controller_details_row(6, "Manufacturer", details.get("Manufacturer", "N/A"))
+        controller_layout.addLayout(self.grid)
+        self.main_grid_layout.addWidget(controller_details_widget, 5, 0, 8, 2)
+        # Grid2: Profile description
+        profile_description_label = QLabel("Profile Methods or Procedures:")
+        profile_description_label.setObjectName("profile_description_label")
+        profile_description_label.setFont(bold_font)
+        profile_description_label.setStyleSheet(styles.color_style_sheet)
+        self.main_grid_layout.addWidget(profile_description_label, 0, 2)
+        self.profile_methods_layout = QVBoxLayout()
+        self.profile_methods_widget = QWidget()
+        self.profile_methods_widget.setObjectName("ProfileContainer")
+        self.profile_methods_widget.setStyleSheet(styles.middle_panel_style_sheet)
+        self.profile_methods_widget.setMinimumWidth(350)
+        self.profile_methods_widget.setMaximumWidth(500)
+        self.profile_methods_widget.setLayout(self.profile_methods_layout)
+        self.main_grid_layout.addWidget(self.profile_methods_widget, 1, 2, 12, 2)
+        back_button = QPushButton("Back")
+        back_button.setFixedSize(100, 40)
+        back_button.setStyleSheet(styles.back_button_style_sheet)
+        back_button.clicked.connect(self.on_back_button_clicked)
+        back_layout = QHBoxLayout()
+        back_layout.addWidget(back_button)
+        back_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.main_grid_layout.addLayout(back_layout, 999, 5)
+        self.main_grid_layout.setColumnStretch(0, 0)
+        self.main_grid_layout.setColumnStretch(1, 0)
+        self.main_grid_layout.setColumnStretch(2, 1)
+        self.setLayout(self.main_grid_layout)
+        self.load_paired_devices()
+        self.setup_logs_section()
+
+    def open_gatt_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("GATT ROLE")
+        dialog.setMinimumSize(200, 100)
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
+        message = QLabel("Select GATT Role")
+        message.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        layout.addWidget(message)
+        buttons_layout = QHBoxLayout()
+        bold_font = QFont()
+        bold_font.setBold(True)
+        server_button = QPushButton("GATT Server")
+        client_button = QPushButton("GATT Client")
+        server_button.setFont(bold_font)
+        client_button.setFont(bold_font)
+        server_button.setFixedWidth(150)
+        client_button.setFixedWidth(150)
+        server_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        client_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        server_button.clicked.connect(lambda: self.select_gatt_role(dialog, "server"))
+        #client_button.clicked.connect(lambda: self.select_gatt_role(dialog, "client"))
+        buttons_layout.addWidget(server_button)
+        buttons_layout.addWidget(client_button)
+        layout.addLayout(buttons_layout)
+        dialog.exec()
+
+    def select_gatt_role(self, dialog, role):
+        dialog.accept()
+        self.clear_profile_ui()
+        if role == "client":
+            widget = self.create_gatt_client_ui()
+            self.profile_methods_layout.addWidget(widget)
+        elif role == "server":
+            widget = self.create_gatt_server_ui()
+            self.profile_methods_layout.addWidget(widget)
+
+    def on_back_button_clicked(self):
+        target_devices = [
+            addr for addr, profiles in self.bluetooth_device_manager.device_profiles.items()
+            if ("A2DP" in profiles or "OPP" in profiles or "PBAP" in profiles) and self.bluetooth_device_manager.is_device_connected(addr)
+        ]
+        if not target_devices:
+            QMessageBox.information(self, "No Devices Connected", "No connected devices to disconnect.")
+            self.log.info("No connected devices with A2DP or OPP profiles to disconnect.")
+            self.back_callback()
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Disconnect Device")
+        dialog.setMinimumSize(300, 150)
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
+
+        message = QLabel(f"Do you want to disconnect all connected devices ?\n\n"
+                         f"Devices to disconnect:\n" + "\n".join(target_devices))
+        layout.addWidget(message)
+        bold_font = QFont()
+        bold_font.setBold(True)
+        buttons_layout = QHBoxLayout()
+        disconnect_button = QPushButton("Disconnect")
+        cancel_button = QPushButton("Cancel")
+
+        disconnect_button.setFont(bold_font)
+        cancel_button.setFont(bold_font)
+        disconnect_button.setFixedWidth(100)
+        cancel_button.setFixedWidth(100)
+
+        disconnect_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+        cancel_button.setStyleSheet(styles.bluetooth_profiles_button_style)
+
+        buttons_layout.addWidget(disconnect_button)
+        buttons_layout.addWidget(cancel_button)
+        layout.addLayout(buttons_layout)
+
+        disconnect_button.clicked.connect(lambda: self.handle_disconnect_clicked(self.device_address))
+        disconnect_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.back_callback()
+
+    def setup_logs_section(self):
+        """Initializes the dump logs tab section with log viewers for Bluetoothd, Pulseaudio, HCI Dump, Obexd, and Ofonod."""
+        bold_font = QFont()
+        bold_font.setBold(True)
+
+        dump_logs_label = QLabel("Dump Logs:")
+        dump_logs_label.setFont(bold_font)
+        dump_logs_label.setStyleSheet(styles.color_style_sheet)
+        self.main_grid_layout.addWidget(dump_logs_label, 0, 4)
+
+        self.dump_logs_text_browser = QTabWidget()
+        self.dump_logs_text_browser.setFixedWidth(400)
+        self.dump_logs_text_browser.setStyleSheet(styles.tab_style_sheet)
+        self.dump_logs_text_browser.setUsesScrollButtons(True)
+        self.main_grid_layout.addWidget(self.dump_logs_text_browser, 1, 4, 12, 2)
+
+        self.setup_bluetoothd_log()
+        self.setup_pulseaudio_log()
+        self.setup_hcidump_log()
+        self.setup_obexd_log()
+        self.setup_ofonod_log()
+
+    def setup_bluetoothd_log(self):
+        """Sets up the Bluetoothd log viewer tab and connects it to the log file for live updates."""
+        normal_font = QFont()
+        normal_font.setBold(False)
+
+        self.bluetoothd_log_text_browser = QTextEdit()
+        self.bluetoothd_log_text_browser.setFont(normal_font)
+        self.bluetoothd_log_text_browser.setMinimumWidth(50)
+        self.bluetoothd_log_text_browser.setReadOnly(True)
+        self.bluetoothd_log_text_browser.setStyleSheet(styles.transparent_textedit_style)
+
+        self.dump_logs_text_browser.addTab(self.bluetoothd_log_text_browser, "Bluetoothd_Logs")
+
+        self.bluetoothd_log_file_fd = open(self.bluetoothd_log_file_path, "r")
+        if self.bluetoothd_log_file_fd:
+            content = self.bluetoothd_log_file_fd.read()
+            self.bluetoothd_log_text_browser.append(content)
+            self.bluetoothd_file_position = self.bluetoothd_log_file_fd.tell()
+
+        self.bluetoothd_file_watcher = QFileSystemWatcher()
+        self.bluetoothd_file_watcher.addPath(self.bluetoothd_log_file_path)
+        self.bluetoothd_file_watcher.fileChanged.connect(self.update_bluetoothd_log)
+
+    def setup_pulseaudio_log(self):
+        """Sets up the Pulseaudio log viewer tab and connects it to the log file for live updates."""
+        normal_font = QFont()
+        normal_font.setBold(False)
+
+        self.pulseaudio_log_text_browser = QTextEdit()
+        self.pulseaudio_log_text_browser.setFont(normal_font)
+        self.pulseaudio_log_text_browser.setMinimumWidth(50)
+        self.pulseaudio_log_text_browser.setReadOnly(True)
+        self.pulseaudio_log_text_browser.setStyleSheet(styles.transparent_textedit_style)
+
+        self.dump_logs_text_browser.addTab(self.pulseaudio_log_text_browser, "Pulseaudio_Logs")
+
+        self.pulseaudio_log_file_fd = open(self.pulseaudio_log_file_path, "r")
+        if self.pulseaudio_log_file_fd:
+            content = self.pulseaudio_log_file_fd.read()
+            self.pulseaudio_log_text_browser.append(content)
+            self.pulseaudio_file_position = self.pulseaudio_log_file_fd.tell()
+
+        self.pulseaudio_file_watcher = QFileSystemWatcher()
+        self.pulseaudio_file_watcher.addPath(self.pulseaudio_log_file_path)
+        self.pulseaudio_file_watcher.fileChanged.connect(self.update_pulseaudio_log)
+
+    def setup_hcidump_log(self):
+        """Sets up the Hcidump log viewer tab and connects it to the log file for live updates."""
+        normal_font = QFont()
+        normal_font.setBold(False)
+
+        self.hci_dump_log_text_browser = QTextEdit()
+        self.hci_dump_log_text_browser.setFont(normal_font)
+        self.hci_dump_log_text_browser.setMinimumWidth(50)
+        self.hci_dump_log_text_browser.setReadOnly(True)
+        self.hci_dump_log_text_browser.setStyleSheet(styles.transparent_textedit_style)
+
+        self.dump_logs_text_browser.addTab(self.hci_dump_log_text_browser, "HCI_Dump_Logs")
+
+        self.hci_log_file_fd = open(self.hcidump_log_name, "r")
+        if self.hci_log_file_fd:
+            content = self.hci_log_file_fd.read()
+            self.hci_dump_log_text_browser.append(content)
+            self.hci_file_position = self.hci_log_file_fd.tell()
+
+        self.hci_file_watcher = QFileSystemWatcher()
+        self.hci_file_watcher.addPath(self.hcidump_log_name)
+        self.hci_file_watcher.fileChanged.connect(self.update_hci_log)
+
+    def setup_obexd_log(self):
+        """Sets up the Obexd log viewer tab and connects it to the log file for live updates."""
+        normal_font = QFont()
+        normal_font.setBold(False)
+
+        self.obexd_log_text_browser = QTextEdit()
+        self.obexd_log_text_browser.setFont(normal_font)
+        self.obexd_log_text_browser.setMinimumWidth(50)
+        self.obexd_log_text_browser.setReadOnly(True)
+        self.obexd_log_text_browser.setStyleSheet(styles.transparent_textedit_style)
+
+        self.dump_logs_text_browser.addTab(self.obexd_log_text_browser, "Obexd_Logs")
+
+        self.obexd_log_file_fd = open(self.obexd_log_file_path, "r")
+        if self.obexd_log_file_fd:
+            content = self.obexd_log_file_fd.read()
+            self.obexd_log_text_browser.append(content)
+            self.obexd_file_position = self.obexd_log_file_fd.tell()
+
+        self.obexd_file_watcher = QFileSystemWatcher()
+        self.obexd_file_watcher.addPath(self.obexd_log_file_path)
+        self.obexd_file_watcher.fileChanged.connect(self.update_obexd_log)
+
+    def setup_ofonod_log(self):
+        """Sets up the Ofonod log viewer tab and connects it to the log file for live updates."""
+        normal_font = QFont()
+        normal_font.setBold(False)
+
+        self.ofonod_log_text_browser = QTextEdit()
+        self.ofonod_log_text_browser.setFont(normal_font)
+        self.ofonod_log_text_browser.setMinimumWidth(50)
+        self.ofonod_log_text_browser.setReadOnly(True)
+        self.ofonod_log_text_browser.setStyleSheet(styles.transparent_textedit_style)
+
+        self.dump_logs_text_browser.addTab(self.ofonod_log_text_browser, "Ofonod_Logs")
+
+        self.ofonod_log_file_fd = open(self.ofonod_log_file_path, "r")
+        if self.ofonod_log_file_fd:
+            content = self.ofonod_log_file_fd.read()
+            self.ofonod_log_text_browser.append(content)
+            self.ofonod_file_position = self.ofonod_log_file_fd.tell()
+
+        self.ofonod_file_watcher = QFileSystemWatcher()
+        self.ofonod_file_watcher.addPath(self.ofonod_log_file_path)
+        self.ofonod_file_watcher.fileChanged.connect(self.update_ofonod_log)
+
+    def update_bluetoothd_log(self):
+        """Updates the bluetoothd log display with new log entries.
+        Reads the bluetoothd log file from the last known position and appends the new content to bluetoothd
+        log text browser."""
+        if self.bluetoothd_log_file_fd:
+            self.bluetoothd_log_file_fd.seek(self.bluetoothd_file_position)
+            content = self.bluetoothd_log_file_fd.read()
+            self.bluetoothd_file_position = self.bluetoothd_log_file_fd.tell()
+            self.bluetoothd_log_text_browser.append(content)
+
+    def update_pulseaudio_log(self):
+        """Updates the pulseaudio log display with new log entries.
+        Reads the pulseaudio log file from the last known position and appends the new content to pulseaudio
+        log text browser."""
+        if self.pulseaudio_log_file_fd:
+            self.pulseaudio_log_file_fd.seek(self.pulseaudio_file_position)
+            content = self.pulseaudio_log_file_fd.read()
+            self.pulseaudio_file_position = self.pulseaudio_log_file_fd.tell()
+            self.pulseaudio_log_text_browser.append(content)
+
+    def update_hci_log(self):
+        """Updates the hcidump log display with new log entries.
+        Reads the hci log file from the last known position and appends the new content to hci dump
+        log text browser."""
+        if self.hci_log_file_fd:
+            self.hci_log_file_fd.seek(self.hci_file_position)
+            content = self.hci_log_file_fd.read()
+            self.hci_file_position = self.hci_log_file_fd.tell()
+            self.hci_dump_log_text_browser.append(content)
+
+    def update_obexd_log(self):
+        """Updates the obexd log display with new log entries.
+        Reads the obexd log file from the last known position and appends the new content to obexd
+        log text browser."""
+        if self.obexd_log_file_fd:
+            self.obexd_log_file_fd.seek(self.obexd_file_position)
+            content = self.obexd_log_file_fd.read()
+            self.obexd_file_position = self.obexd_log_file_fd.tell()
+            self.obexd_log_text_browser.append(content)
+
+    def update_ofonod_log(self):
+        """Updates the ofonod log display with new log entries.
+        Reads the ofonod log file from the last known position and appends the new content to ofonod
+        log text browser."""
+        if self.ofonod_log_file_fd:
+            self.ofonod_log_file_fd.seek(self.ofonod_file_position)
+            content = self.ofonod_log_file_fd.read()
+            self.ofonod_file_position = self.ofonod_log_file_fd.tell()
+            self.ofonod_log_text_browser.append(content)
+
+    def prompt_file_transfer_confirmation(self, file_path):
+        """Prompt user to confirm a file transfer and return their decision.
+
+        Args:
+            file_path: The full path of the incoming file.
+        """
+        file_name = os.path.basename(file_path)
+        msg_box = QMessageBox()
+        msg_box.setWindowTitle("Incoming File")
+        msg_box.setText(f"Accept incoming file?\n\n{file_name}")
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg_box.setIcon(QMessageBox.Icon.Question)
+        result = msg_box.exec()
+        return result == QMessageBox.StandardButton.Yes
+
+    def clear_profile_ui(self):
+        """Clears the profile UI by stopping any ongoing media playback timer,
+        removing all widgets from the profile layout, and resetting all related
+        widget references to None to prevent further access."""
+        self.stop_media_playback_timer()
+        self.clear_layout(self.profile_methods_layout)
+        self.device_tab_widget = None
+        self.a2dp_tab_placeholder = None
+        self.opp_tab_placeholder = None
+        self.track_status_label = None
+        self.song_title_label = None
+        self.song_artist_label = None
+        self.song_album_label = None
+        self.progress_slider = None
+        self.elapsed_time_label = None
+        self.remaining_time_label = None
+
+    def start_media_playback_timer(self):
+        """Starts a timer that periodically updates media playback information every second."""
+        if hasattr(self, "playback_timer") and self.playback_timer is not None:
+            if self.playback_timer.isActive():
+                self.playback_timer.stop()
+            self.playback_timer.deleteLater()
+        self.playback_timer = QTimer(self)
+        self.playback_timer.timeout.connect(self.media_player_info)
+        self.playback_timer.start(1000)
+
+    def stop_media_playback_timer(self):
+        """Stops and deletes the media playback timer if it exists and is active."""
+        if hasattr(self, "playback_timer") and self.playback_timer is not None:
+            if self.playback_timer.isActive():
+                self.playback_timer.stop()
+            self.playback_timer.deleteLater()
+            self.playback_timer = None
+
+    def browse_audio_files(self):
+        """Browse and add multiple audio files to playlist."""
+        files, _ = QFileDialog.getOpenFileNames(caption="Select Audio File", filter="WAV files (*.wav)")
+        invalid_files = []
+        for file_path in files:
+            if os.path.exists(file_path):
+                self.audio_playlist.addItem(file_path)
+            else:
+                invalid_files.append(file_path)
+        if invalid_files:
+            warning_msg = "The following files were not found and were not added:\n" + "\n".join(invalid_files)
+            QMessageBox.warning(self, "File Not Found", warning_msg)
+
+    def volume_control(self):
+        """Retrieves the current media volume from the sink device and updates the volume slider UI.
+        If the volume is successfully retrieved, it sets the value of `sink_volume_slider`.
+        """
+        volume = self.bluetooth_device_manager.get_media_volume(self.device_address_sink)
+        if volume is not None:
+            self.sink_volume_slider.setValue(volume)
+
+    def set_device_volume(self, value):
+        """Sets the media volume on the sink device to the specified value.
+
+        Args:
+            value: The volume level to be set.
+        """
+        self.bluetooth_device_manager.set_media_volume(self.device_address_sink, value)
+
+    def media_player_info(self):
+        """Updates the media player UI with current playback information from the sink device.
+        Displays track status, title, artist, album, and playback progress.
+        If no information is available, resets the display to default 'unknown' values.
+        """
+        if not hasattr(self, "track_status_label") or self.track_status_label is None:
+            self.log.warning("Track status label does not exist anymore. Skipping update.")
+            return
+        info = self.bluetooth_device_manager.get_media_playback_info(self.device_address_sink)
+        if not info:
+            self.track_status_label.setText("Status: Unknown")
+            self.song_title_label.setText("Title: Unknown")
+            self.song_artist_label.setText("Artist: -")
+            self.song_album_label.setText("Album: -")
+            self.progress_slider.setEnabled(False)
+            self.progress_slider.setValue(0)
+            self.elapsed_time_label.setText("00:00")
+            self.remaining_time_label.setText("00:00")
+            return
+        status = info["status"]
+        track = info["track"]
+        position = info["position"] // 1000
+        duration = info["duration"] // 1000
+        title = track.get("title", "Unknown")
+        artist = track.get("artist", "-")
+        album = track.get("album", "-")
+        try:
+            self.track_status_label.setText(f"Status: {status}")
+            self.song_title_label.setText(title)
+            self.song_artist_label.setText(artist)
+            self.song_album_label.setText(album)
+            self.progress_slider.setEnabled(True)
+            self.progress_slider.setMaximum(duration)
+            self.progress_slider.setValue(position)
+            elapsed_mins = position // 60
+            elapsed_secs = position % 60
+            remaining = duration - position
+            remaining_mins = remaining // 60
+            remaining_secs = remaining % 60
+            self.elapsed_time_label.setText(f"{elapsed_mins:02}:{elapsed_secs:02}")
+            self.remaining_time_label.setText(f"{remaining_mins:02}:{remaining_secs:02}")
+        except RuntimeError as e:
+            pass
+
+
+    def remove_selected_file(self):
+        """Removes the selected file(s) from the audio playlist and internal data."""
+        device = self.device_address_sink
+        selected_items = self.audio_playlist.selectedItems()
+        if not selected_items:
+            return
+
+        for item in selected_items:
+            file_name = item.text()
+            self.audio_playlist.takeItem(self.audio_playlist.row(item))
+            if device in self.audio_playlist_data and file_name in self.audio_playlist_data[device]:
+                self.audio_playlist_data[device].remove(file_name)
+
+    def clear_playlist(self):
+        """Clears all items from the audio playlist."""
+        self.audio_playlist.clear()
+
+    def set_source_volume(self, value):
+        """Sets the media volume for the A2DP source device.
+
+        Args:
+            value: The volume level to set.
+        """
+        self.bluetooth_device_manager.set_media_volume(self.device_address_source, value)
+
+    def refresh_tab(self, placeholder: QWidget, panel: QWidget):
+        """Replaces the contents of a placeholder widget with the given panel.
+        Clears existing layout and widgets, sets a new layout with the panel, and updates the UI.
+
+        Args:
+            placeholder: The container widget to refresh.
+            panel: The new content widget.
+        """
+        old_layout = placeholder.layout()
+        if old_layout is not None:
+            while old_layout.count():
+                child = old_layout.takeAt(0)
+                if child.widget():
+                    child.widget().setParent(None)
+            QWidget().setLayout(old_layout)
+
+        layout = QVBoxLayout()
+        layout.addWidget(panel)
+        placeholder.setLayout(layout)
+
+        placeholder.repaint()
+        placeholder.update()
+        placeholder.updateGeometry()
+        QCoreApplication.processEvents()
+
+
+    def handle_start_server(self):
+        """Handles the Start Server button click."""
+        self.bluetooth_device_manager.create_gatt_server(
+            self.service_combobox.currentText()
+        )
+        self.update_server_state(True)
+        QMessageBox.information(self, "Server", "Server started.")
+
+    def handle_stop_server(self):
+        """Handles the Stop Server button click (full shutdown, including advertising)."""
+        self.bluetooth_device_manager.stop_gatt_server()
+        self.update_server_state(False)
+        QMessageBox.information(self, "Server", "Server stopped.")
+
+
+    def handle_advertising(self):
+        """Open a dialog for selecting a BLE service to advertise and start advertising the corresponding service UUID."""
+        items = [
+            "Battery Service (0x180F)",
+            "Scan Parameters Service (0x1813)",
+            "Immediate Alert Service (0x1802)",
+            "Health Thermometer Service (0x1809)",
+            "Phone Alert Status Service (0x180E)"
+        ]
+
+        service_choice, ok = QInputDialog.getItem(self, "Select Service to Advertise", "Service:", items, 0, False)
+        if not ok:
+            return
+
+        if service_choice.startswith("Battery"):
+            uuid = "180F"
+        elif service_choice.startswith("Scan Parameters"):
+            uuid = "1813"
+        elif service_choice.startswith("Immediate Alert"):
+            uuid = "1802"
+        elif service_choice.startswith("Health Thermometer"):
+            uuid = "1809"
+        elif service_choice.startswith("Phone Alert Status"):
+            uuid = "180E"
+
+        self.bluetooth_device_manager.start_advertising(uuid)
+        QMessageBox.information(self, "Advertising", f"Advertising {uuid} started.")
+
+
+    def update_connected_device_panel(self):
+        """Update the UI panel that displays information about the currently connected BLE device."""
+        devices = self.bluetooth_device_manager.get_connected_devices()
+
+        if not devices:
+            self.dev_name_label.setText("Name: None ")
+            self.dev_addr_label.setText("Address: None")
+            self.dev_state_label.setText("State: Not Connected")
+            return
+
+        addr = next(iter(devices.keys()))
+        name = devices[addr]
+
+        self.dev_name_label.setText(f"Name: {name}")
+        self.dev_addr_label.setText(f"Address: {addr}")
+        self.dev_state_label.setText("State: Connected")
+
+
+    def create_gatt_server_ui(self):
+        """Build and initialize the full GATT Server UI layout.
+
+        Returns:
+            The root widget containing the constructed UI.
+        """
+        bold_font = QFont("Segoe UI", 10, QFont.Weight.Bold)
+        normal_font = QFont("Arial", 9)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(16)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        title = QLabel("GATT Server")
+        title.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        layout.addWidget(title)
+
+        service_panel = QGroupBox("Service Details")
+        service_panel.setFont(bold_font)
+        service_panel_layout = QVBoxLayout()
+        service_panel_layout.setSpacing(6)
+
+        self.service_combobox = QComboBox()
+        self.service_combobox.addItems([
+            "Battery Service (0x180F)",
+            "Scan Parameters Service (0x1813)",
+            "Immediate Alert Service (0x1802)",
+            "Health Thermometer Service (0x1809)",
+            "Phone Alert Status Service (0x180E)"
+        ])
+
+        self.service_combobox.setFont(QFont("Arial", 10))
+        service_panel_layout.addWidget(QLabel("Select Service:"))
+        service_panel_layout.addWidget(self.service_combobox)
+
+        service_panel.setLayout(service_panel_layout)
+        layout.addWidget(service_panel)
+
+        control_panel = QGroupBox("Server Controls")
+        control_panel.setFont(bold_font)
+        control_panel_layout = QVBoxLayout()
+        control_panel_layout.setSpacing(10)
+
+        self.start_service_button = QPushButton("Start Server")
+        self.stop_service_button = QPushButton("Stop Server")
+        self.show_connected_button = QPushButton("Show Connected Device")
+
+        for button in (self.start_service_button, self.stop_service_button, self.show_connected_button):
+            button.setStyleSheet(styles.bluetooth_profiles_button_style)
+            button.setMinimumHeight(30)
+
+        self.start_service_button.clicked.connect(self.handle_start_server)
+        self.stop_service_button.clicked.connect(self.handle_stop_server)
+        self.show_connected_button.clicked.connect(self.update_connected_device_panel)
+
+        control_panel_layout.addWidget(self.start_service_button)
+        control_panel_layout.addWidget(self.stop_service_button)
+        control_panel_layout.addWidget(self.show_connected_button)
+
+        control_panel.setLayout(control_panel_layout)
+        layout.addWidget(control_panel)
+        status_panel = QGroupBox("Server Status")
+        status_panel.setFont(bold_font)
+        status_panel_layout = QHBoxLayout()
+
+        self.server_state_tag = QLabel("Stopped")
+        self.server_state_tag.setFont(normal_font)
+        self.server_state_tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.server_state_tag.setFixedWidth(100)
+        self.server_state_tag.setStyleSheet("background: #cc3333; color: white; padding: 4px; border-radius: 6px;")
+
+        status_panel_layout.addWidget(QLabel("State:"))
+        status_panel_layout.addWidget(self.server_state_tag)
+        status_panel_layout.addStretch(1)
+
+        status_panel.setLayout(status_panel_layout)
+        layout.addWidget(status_panel)
+
+        device_panel = QGroupBox("Connected Device Details")
+        device_panel.setFont(bold_font)
+        device_panel_layout = QVBoxLayout()
+        device_panel_layout.setSpacing(6)
+
+        self.device_info_box = QWidget()
+        deviceinfo_layout = QVBoxLayout()
+        deviceinfo_layout.setContentsMargins(10, 10, 10, 10)
+        self.device_info_box.setStyleSheet(styles.bluetooth_profiles_groupbox_style)
+        self.dev_name_label = QLabel("Name: -")
+        self.dev_addr_label = QLabel("Address: -")
+        self.dev_state_label = QLabel("State: -")
+
+        for label in (self.dev_name_label, self.dev_addr_label, self.dev_state_label):
+            label.setFont(QFont("Arial", 10))
+            label.setStyleSheet("color: black;")
+
+        deviceinfo_layout.addWidget(self.dev_name_label)
+        deviceinfo_layout.addWidget(self.dev_addr_label)
+        deviceinfo_layout.addWidget(self.dev_state_label)
+        self.device_info_box.setLayout(deviceinfo_layout)
+
+        device_panel_layout.addWidget(self.device_info_box)
+        device_panel.setLayout(device_panel_layout)
+        layout.addWidget(device_panel)
+
+        layout.addStretch()
+
+        widget = QWidget()
+        widget.setLayout(layout)
+        self.profile_methods_layout.insertWidget(0, widget)
+        return widget
+
+    def update_server_state(self, running):
+        """Update the server state tag UI to reflect whether the GATT server is running or stopped.
+
+        Args:
+            running: True if the server is active, False if stopped.
+        """
+        if running:
+            self.server_state_tag.setText("Running")
+            self.server_state_tag.setObjectName("StartServer")
+            self.server_state_tag.setStyleSheet(styles.gatt_server_stylesheet)
+        else:
+            self.server_state_tag.setText("Stopped")
+            self.server_state_tag.setObjectName("StopServer")
+            self.server_state_tag.setStyleSheet(styles.gatt_server_stylesheet)
+
+
+    def create_hfp_profile_ui(self, device_address):
+        """Creates and sets up the UI for handling HFP (Hands-Free Profile) operations on a Bluetooth device.
+
+        Args:
+            device_address: The Bluetooth address of remote device.
+        """
+        widget = QWidget()
+        widget.setStyleSheet(styles.widget_style_sheet)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(15, 15, 15, 15)
+        self.phone_number_input = QLineEdit(widget)
+        self.phone_number_input.setPlaceholderText("Enter phone number")
+        self.dial_button = QPushButton("Dial", widget)
+        self.answer_call_button = QPushButton("Answer", widget)
+        self.hangup_button = QPushButton("Hang Up", widget)
+        self.dial_last_button = QPushButton("Dial Last", widget)
+        for button in [self.dial_button, self.answer_call_button, self.hangup_button, self.dial_last_button]:
+            button.setFixedHeight(20)
+        basic_layout = QVBoxLayout()
+        basic_layout.addWidget(self.phone_number_input)
+        for button in [self.dial_button, self.answer_call_button, self.hangup_button, self.dial_last_button]:
+            basic_layout.addWidget(button)
+        advanced_controls_layout = QVBoxLayout()
+        self.swap_calls_button = QPushButton("Swap Calls", widget)
+        self.hold_answer_button = QPushButton("Hold and Answer", widget)
+        self.release_answer_button = QPushButton("Release and Swap", widget)
+        self.create_multiparty_button = QPushButton("Create Multiparty", widget)
+        self.hangup_multiparty_button = QPushButton("Hangup Multiparty", widget)
+        self.transfer_calls_button = QPushButton("Transfer Calls", widget)
+        self.dtmf_input = QLineEdit(widget)
+        self.dtmf_input.setPlaceholderText("Enter DTMF tones (0-9, #, 'A-D)")
+        self.send_tones_button = QPushButton("Send Tones", widget)
+        self.send_tones_button.setFixedHeight(20)
+        for button in [self.swap_calls_button, self.hold_answer_button, self.release_answer_button,
+                       self.create_multiparty_button, self.hangup_multiparty_button,
+                       self.transfer_calls_button]:
+            advanced_controls_layout.addWidget(button)
+        private_layout = QHBoxLayout()
+        self.call_selector = QComboBox(widget)
+        self.call_selector.setPlaceholderText("Select Active Call")
+        self.call_selector.setMinimumWidth(200)
+        self.call_selector.setStyleSheet(styles.hfp_call_selector_stylesheet)
+        self.private_chat_button = QPushButton("Private Chat", widget)
+        self.private_chat_button.setFixedHeight(30)
+        self.refresh_calls_button = QPushButton("Show", widget)
+        self.refresh_calls_button.setFixedSize(60, 30)
+        private_layout.addWidget(self.call_selector)
+        private_layout.addWidget(self.private_chat_button)
+        private_layout.addWidget(self.refresh_calls_button)
+        advanced_controls_layout.addLayout(private_layout)
+        call_handling_layout = QVBoxLayout()
+        call_handling_layout.addLayout(basic_layout)
+        call_handling_layout.addLayout(advanced_controls_layout)
+        call_handling_layout.addWidget(self.dtmf_input)
+        call_handling_layout.addWidget(self.send_tones_button)
+        call_handling_group = self.create_hfp_sections("Call Handling", call_handling_layout, parent=widget)
+        layout.addWidget(call_handling_group)
+        self.bluetooth_device_manager.setup_hfp_manager(device_address)
+        self.device_address = device_address
+        self.bluetooth_device_manager.on_call_event = self.handle_call_event
+        self.dial_button.clicked.connect(
+            lambda: self.bluetooth_device_manager.dial_number(device_address, self.phone_number_input.text()))
+        self.answer_call_button.clicked.connect(
+            lambda: self.bluetooth_device_manager.answer_call(device_address))
+        self.hangup_button.clicked.connect(
+            lambda: self.bluetooth_device_manager.hangup_all_calls(device_address))
+        self.dial_last_button.clicked.connect(
+            lambda: self.bluetooth_device_manager.dial_last(device_address))
+        self.swap_calls_button.clicked.connect(
+            lambda: self.bluetooth_device_manager.swap_calls(device_address))
+        self.hold_answer_button.clicked.connect(
+            lambda: self.bluetooth_device_manager.hold_and_answer(device_address))
+        self.release_answer_button.clicked.connect(
+            lambda: self.bluetooth_device_manager.release_and_swap(device_address))
+        self.transfer_calls_button.clicked.connect(
+            lambda : self.bluetooth_device_manager.transfer_calls(device_address))
+        self.create_multiparty_button.clicked.connect(
+            lambda: (
+                self.bluetooth_device_manager.create_multiparty(device_address),
+                self.refresh_calls_button.click()))
+        self.hangup_multiparty_button.clicked.connect(
+            lambda: self.bluetooth_device_manager.hangup_multiparty(device_address))
+        self.private_chat_button.clicked.connect(
+            lambda: self.bluetooth_device_manager.private_chat(
+                device_address, self.call_selector.currentData()))
+        self.refresh_calls_button.clicked.connect(
+            lambda: (self.call_selector.clear(),
+                [
+                    self.call_selector.addItem(f"{num} ({path.split('/')[-1]})", path)
+                    for path, num in (self.bluetooth_device_manager.get_active_calls() or {}).items()
+                ]))
+        self.send_tones_button.clicked.connect(lambda: self.bluetooth_device_manager.send_dtmf_tones(device_address, self.dtmf_input.text().strip()))
+        layout.addStretch(1)
+        return widget
+
+    def create_hfp_sections(self, title, inner_layout, parent=None):
+        """Create a collapsible section for the Hands-Free Profile (HFP) UI.
+
+        Args:
+            title: The title displayed on the collapsible section header.
+            inner_layout: The layout containing widgets for this section.
+            parent: The parent widget. Defaults to None.
+
+        Returns:
+            container: A container widget that includes the toggle button and collapsible content area.
+        """
+        container = QWidget(parent)
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(2)
+        toggle = QToolButton(container)
+        toggle.setText(title)
+        toggle.setCheckable(True)
+        toggle.setChecked(False)
+        toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toggle.setArrowType(Qt.ArrowType.RightArrow)
+        toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        toggle.setStyleSheet(styles.hfptoggle_stylesheet)
+        content = QGroupBox(container)
+        content.setLayout(inner_layout)
+        content.setMaximumHeight(0)
+        content.setWindowOpacity(0.0)
+        content.setVisible(False)
+        content.setStyleSheet(styles.content_stylesheet)
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(10)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        shadow.setOffset(0, 2)
+        content.setGraphicsEffect(shadow)
+        height_animation = QPropertyAnimation(content, b"maximumHeight")
+        height_animation.setDuration(250)
+        height_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        fade_animation = QPropertyAnimation(content, b"windowOpacity")
+        fade_animation.setDuration(250)
+        fade_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        animation_group = QParallelAnimationGroup()
+        animation_group.addAnimation(height_animation)
+        animation_group.addAnimation(fade_animation)
+        self.hfp_sections.append(toggle)
+        toggle.toggled.connect(lambda checked: (
+            content.setVisible(True) if checked else content.setVisible(False),
+            height_animation.setStartValue(0 if checked else content.height()),
+            height_animation.setEndValue(content.sizeHint().height() if checked else 0),
+            fade_animation.setStartValue(0.0 if checked else 1.0),
+            fade_animation.setEndValue(1.0 if checked else 0.0),
+            toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow),
+            animation_group.start()
+        ))
+        container_layout.addWidget(toggle)
+        container_layout.addWidget(content)
+        return container
+
+    def handle_call_event(self, call_path, number, state):
+        """Handle Bluetooth call state changes and update the UI accordingly.
+
+        Args:
+            call_path: The D-Bus object path or unique identifier for the call.
+            number: The phone number associated with the call event.
+            state: The current state of the call.
+        """
+        message = None
+        if state == "incoming":
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Incoming Call")
+            layout = QVBoxLayout(dialog)
+
+            label = QLabel(f" Incoming call from {number}")
+            accept_button = QPushButton("Accept")
+            reject_button = QPushButton("Reject")
+
+            layout.addWidget(label)
+            layout.addWidget(accept_button)
+            layout.addWidget(reject_button)
+            dialog.setLayout(layout)
+            accept_button.clicked.connect(lambda: [
+                self.bluetooth_device_manager.answer_call(self.device_address), dialog.accept(),
+                QMessageBox.information(self, "Call", f"Call from {number} answered.")
+            ])
+            reject_button.clicked.connect(lambda: [
+                self.bluetooth_device_manager.hangup_all_calls(self.device_address), dialog.reject(),
+                QMessageBox.information(self, "Call", f"Call from {number} rejected.")
+            ])
+            dialog.exec()
+        elif state == "dialing":
+            message = f"Dialing {number}...."
+        elif state == "active":
+            message = f"Call active with {number}"
+        elif state in ("disconnected", "terminated"):
+            message = f"Call ended with {number}"
+        if message:
+            QMessageBox.information(self, "Call Status", message)
